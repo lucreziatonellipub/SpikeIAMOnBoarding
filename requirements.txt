@@ -1,0 +1,5 @@
+chainlit
+requests
+pandas
+python-dotenv
+openpyxl

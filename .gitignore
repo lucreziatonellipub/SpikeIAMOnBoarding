@@ -1,0 +1,24 @@
+# Ambienti virtuali
+venv/
+env/
+.venv/
+
+# Variabili d'ambiente (MOLTO IMPORTANTE)
+.env
+
+# Cache di Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# File generati dall'utente (opzionale, evita di caricare test sporchi)
+*.xlsx
+*.xls
+*.csv
+# Nota: se creerai una cartella "template/" per il file vuoto, 
+# aggiungi un'eccezione come "!template/*.xlsx" in futuro.
+
+# Chainlit / Frontend
+.chainlit/
