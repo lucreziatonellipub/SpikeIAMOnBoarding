@@ -1,4 +1,3 @@
-```markdown
 # 🚀 Spike IAM - Onboarding Bot
 
 Un assistente conversazionale basato su **Chainlit** e potenziato da un LLM custom (tramite Kong API) per automatizzare l'onboarding dei sistemi target su Spike IAM. 
