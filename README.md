@@ -1,4 +1,3 @@
-```markdown
 # 🚀 Spike IAM - Onboarding Bot
 
 Un assistente conversazionale basato su **Chainlit** e potenziato da un LLM custom (tramite Kong API) per automatizzare l'onboarding dei sistemi target su Spike IAM. 
@@ -75,4 +74,3 @@ Il progetto è attualmente in fase Alpha. I prossimi step di sviluppo previsti s
 * [ ] **Strutturazione del Template Excel:** Disegnare e generare dinamicamente il file `template_onboarding.xlsx` in modo che rispecchi esattamente le domande caricate a sistema, inserendo la logica Pandas per il parsing riga per riga del file caricato dall'utente.
 * [ ] **Integrazione Database Self-Hosted:** Sostituire il salvataggio dei log su console con l'ingestion strutturata in un database relazionale. Verrà valutato **PostgreSQL** puro o una soluzione come **Supabase** (self-hosted) per memorizzare in modo persistente le anagrafiche aziendali, i sistemi target e il JSON validato delle risposte.
 
-```
