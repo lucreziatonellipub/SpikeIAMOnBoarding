@@ -1,7 +1,6 @@
 import chainlit as cl
 import requests
 import pandas as pd
-import io
 import json
 import urllib3
 import os
@@ -11,182 +10,226 @@ load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# SEZIONE 1: Configurazione API Kong Custom
+# SECTION 1: Custom Kong API Configuration
 # ==========================================
 def call_kong_llm(user_message: str, system_prompt: str = "") -> str:
     kong_url = os.getenv("KONG_URL")
     api_key = os.getenv("KONG_API_KEY")
     
     if not kong_url or not api_key:
-        return '{"is_valid": false, "feedback": "Errore: KONG_URL o KONG_API_KEY mancanti nel file .env"}'
+        return '{"status": "error", "message": "Error: Missing KONG_URL or KONG_API_KEY"}'
 
     headers = {"api-key": api_key}
     payload = {
-        "messages": [{"role": "system", "content": system_prompt}],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
         "temperature": 0.0
     }
-    
-    print("\n" + "="*50)
-    print(f"🚀 [API KONG] - URL: {kong_url}")
-    print("="*50 + "\n")
     
     try:
         response = requests.post(kong_url, headers=headers, json=payload, verify=False)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return json.dumps({"is_valid": False, "feedback": f"Errore API: {str(e)}"})
+        return json.dumps({"status": "error", "message": f"API Error: {str(e)}"})
+
 
 # ==========================================
-# SEZIONE 2: Schermata Iniziale e Setup
+# SECTION 2: Dynamic Excel Reading
+# ==========================================
+def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+        # Assuming the column is still named 'Domanda' in your Excel. 
+        # Change to 'Question' if you translate the Excel header too.
+        return df['Domanda'].dropna().tolist()
+    except Exception as e:
+        print(f"Error reading the Excel file: {e}")
+        # Fallback questions in case of error
+        return [
+            "Is the target system exposed to the internet or only available on the intranet?",
+            "What authentication protocol does it use?",
+            "Is there a test environment separated from the production one?"
+        ]
+
+# ==========================================
+# SECTION 3: Initial Flow Management
 # ==========================================
 @cl.on_chat_start
 async def start():
-    # Setup stato sessione
-    domande = [
-        "Il sistema target è esposto su internet o solo in intranet?",
-        "Quale protocollo di autenticazione utilizza (es. SAML, OIDC, LDAP)?",
-        "Esiste un ambiente di test separato da quello di produzione?"
-    ]
-    cl.user_session.set("domande", domande)
-    cl.user_session.set("risposte", {})
-    cl.user_session.set("current_question_index", 0)
-    cl.user_session.set("modalita", None) # Nessuna modalità scelta all'inizio
-
-    # Flow grafico di benvenuto
-    res_azienda = await cl.AskUserMessage(
-        content="### 👋 Benvenuto in Spike IAM Onboarding\n\nPer configurare il tuo ambiente, inserisci il **Nome dell'Azienda**:", 
-        timeout=120
-    ).send()
-    azienda = res_azienda['output'] if res_azienda else "Sconosciuta"
+    # Setup session state
+    cl.user_session.set("answers", {})
+    cl.user_session.set("step", "company")
     
-    res_sistema = await cl.AskUserMessage(
-        content=f"🏢 **Azienda:** {azienda}\n\nOttimo. Qual è il **Target System** che stiamo integrando?", 
-        timeout=120
-    ).send()
-    sistema = res_sistema['output'] if res_sistema else "Sconosciuto"
-    
-    cl.user_session.set("azienda", azienda)
-    cl.user_session.set("sistema", sistema)
-
-    # I bottoni ora NON vengono cancellati dopo il click, permettendo di cambiare idea
-    actions = [
-        cl.Action(name="scelta_percorso", payload={"value": "excel"}, label="📁 Usa file Excel"),
-        cl.Action(name="scelta_percorso", payload={"value": "chat"}, label="💬 Usa la Chat")
-    ]
-
     await cl.Message(
-        content=f"✅ **Setup Completato!**\nTarget: **{sistema}** ({azienda}).\n\nCome preferisci inserire i dati? *(Puoi cambiare idea in qualsiasi momento cliccando sui bottoni qui sotto)*",
-        actions=actions
+        content="### 👋 Welcome to Spike IAM Onboarding\n\nTo configure your environment, please enter the **Company Name**:"
     ).send()
 
-# ==========================================
-# SEZIONE 3: Switch Dinamico Modalità (Senza Blocchi)
-# ==========================================
-@cl.action_callback("scelta_percorso")
-async def on_action(action: cl.Action):
-    scelta = action.payload.get("value")
-    modalita_attuale = cl.user_session.get("modalita")
-    
-    # Se l'utente clicca il bottone della modalità in cui è già, non facciamo nulla
-    if modalita_attuale == scelta:
-        return
-        
-    cl.user_session.set("modalita", scelta)
-
-    if scelta == "excel":
-        placeholder_content = b"Questo e' un file di test fittizio. Da sostituire."
-        template_file = cl.File(name="template_onboarding.xlsx", content=placeholder_content, display="inline")
-        
-        await cl.Message(
-            content="📂 **Modalità Excel attivata.**\n\n1. Scarica il template qui sotto.\n2. Compilalo.\n3. **Trascinalo in questa chat (come allegato)** per inviarlo.\n\n*(Hai cambiato idea? Clicca 'Usa la Chat' in alto)*",
-            elements=[template_file]
-        ).send()
-        
-    elif scelta == "chat":
-        cl.user_session.set("current_question_index", 0) # Ripartiamo dalla prima domanda
-        domande = cl.user_session.get("domande")
-        await cl.Message(
-            content=f"💬 **Modalità Chat attivata.** Rispondi a queste brevi domande.\n\n*(Hai cambiato idea? Clicca 'Usa file Excel' in alto)*\n\n---\n**Domanda 1:** {domande[0]}"
-        ).send()
-
-# ==========================================
-# SEZIONE 4: Gestione Unificata Input Utente (File e Testo)
-# ==========================================
 @cl.on_message
 async def main(message: cl.Message):
-    modalita = cl.user_session.get("modalita")
+    step = cl.user_session.get("step")
+    answers = cl.user_session.get("answers")
     
-    if not modalita:
-        await cl.Message(content="⚠️ Seleziona prima una modalità dai bottoni in alto (Excel o Chat).").send()
-        return
-
-    # --- FLUSSO EXCEL ---
-    if modalita == "excel":
-        # Cerchiamo se l'utente ha allegato dei file al suo messaggio
-        files = [element for element in message.elements if element.type == "file"]
+    # --- STEP 1: Company ---
+    if step == "company":
+        cl.user_session.set("company", message.content)
+        cl.user_session.set("step", "system")
+        await cl.Message(
+            content=f"🏢 **Company:** {message.content}\n\nGreat. What is the **Name of the Target System** we are integrating?"
+        ).send()
         
-        if not files:
-            await cl.Message(content="⚠️ Non hai allegato nessun file. Clicca sull'icona della graffetta o trascina l'Excel nella chat.").send()
-            return
+    # --- STEP 2: System ---
+    elif step == "system":
+        cl.user_session.set("system", message.content)
+        cl.user_session.set("step", "system_type")
+        
+        actions = [
+            cl.Action(name="choose_type", payload={"value": "Generic"}, label="Generic"),
+            cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
+            cl.Action(name="choose_type", payload={"value": "Target DB"}, label="Target DB"),
+            cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP")
+        ]
+        
+        await cl.Message(
+            content=f"✅ Target System: **{message.content}**.\n\nWhat **type** of target system is it? Choose an option below to load the specific questions.",
+            actions=actions
+        ).send()
+
+    # --- EXTRA CHECK: User types instead of clicking the button ---
+    elif step == "system_type":
+        await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send()
+
+    # --- STEP 3: Conversational Chat (Extraction, Validation, Explanation) ---
+    elif step == "conversational_chat":
+        questions = cl.user_session.get("questions")
+        
+        # Find which questions have not been answered yet
+        pending_questions = [q for q in questions if q not in answers or not answers[q]]
+        
+        if not pending_questions:
+            return # Interview already completed
             
-        file = files[0]
-        if not file.name.endswith(('.xlsx', '.xls')):
-            await cl.Message(content="⚠️ Il file non sembra un Excel valido. Riprova con un .xlsx").send()
-            return
-            
-        await cl.Message(content=f"📥 **Analisi del file in corso:** `{file.name}`...").send()
+        current_question = pending_questions[0]
         
-        # Logica Pandas fittizia
-        await cl.Message(content="✅ **Estrazione completata!** I dati sono stati strutturati e salvati a sistema.").send()
-        return
+        async with cl.Step(name="Intent and Data Analysis"):
+            # UNIFIED PROMPT: Acts as Validator, Explainer, and Multiple Extractor
+            system_prompt_orchestrator = f"""You are an expert technical assistant in IAM (Identity and Access Management).
+Your goal is to gather technical information from a user in a conversational manner.
 
-    # --- FLUSSO CHAT ---
-    elif modalita == "chat":
-        index = cl.user_session.get("current_question_index")
-        domande = cl.user_session.get("domande")
-        risposte = cl.user_session.get("risposte")
-        
-        domanda_corrente = domande[index]
-        risposta_utente = message.content
+CURRENT QUESTION ASKED TO THE USER: "{current_question}"
 
-        async with cl.Step(name="Analisi Risposta AI"):
-            system_prompt = f"""Sei un validatore esperto per un onboarding IAM.
-Domanda: "{domanda_corrente}"
-Risposta: "{risposta_utente}"
+ALL REMAINING QUESTIONS TO BE SATISFIED:
+{json.dumps(pending_questions, ensure_ascii=False)}
 
-Regole:
-- Accetta la risposta se contiene info utili/tecniche inerenti, non solo gli esempi citati.
-- Rifiuta se è "non so", fuori contesto o vuota.
-Rispondi SOLO in JSON: {{"is_valid": true/false, "feedback": "spiegazione"}}"""
+ANALYZE THE USER'S MESSAGE AND CHOOSE ONE OF 3 ACTIONS:
+1. "clarification": The user didn't understand the question, asks "what does it mean?", "what do you mean?", or asks for help. Provide a technical but clear and accessible explanation in "message", using practical examples.
+2. "invalid": The user tries to answer, but the response is "I don't know", out of context, or too vague/incomplete to be accepted. Kindly explain in "message" why you need more details.
+3. "success": The user provides a technically valid and comprehensive answer. Extract the answer. ALSO, check if their response happens to answer OTHER questions in the list of remaining questions, and extract those as well. Use "message" to give a brief success feedback (e.g., "Perfect, I've noted the details.").
 
-            esito_llm = call_kong_llm(user_message=risposta_utente, system_prompt=system_prompt)
+REPLY ONLY AND EXCLUSIVELY WITH THIS JSON (no markdown or text outside the json):
+{{
+    "status": "clarification" | "invalid" | "success",
+    "message": "Your response message for the user (explanation, feedback, or confirmation)",
+    "extracted_data": {{
+        "EXACT text of the question taken from the array": "Extracted, cleaned, and summarized answer"
+    }}
+}}
+Note: "extracted_data" must be populated ONLY if status is "success"."""
+
+            analysis_str = call_kong_llm(user_message=message.content, system_prompt=system_prompt_orchestrator)
         
         try:
-            valutazione = json.loads(esito_llm.replace("```json", "").replace("```", "").strip())
-            is_valid = valutazione.get("is_valid", False)
-            feedback = valutazione.get("feedback", "Errore tecnico.")
-        except json.JSONDecodeError:
-            is_valid, feedback = False, "Risposta del server non interpretabile."
+            clean_json = analysis_str.replace("```json", "").replace("```", "").strip()
+            analysis = json.loads(clean_json)
+            
+            status = analysis.get("status", "error")
+            response_message = analysis.get("message", "Comprehension error.")
+            extracted_data = analysis.get("extracted_data", {})
 
-        if is_valid:
-            risposte[domanda_corrente] = risposta_utente
-            cl.user_session.set("risposte", risposte)
-            
-            await cl.Message(content=f"✅ {feedback}").send()
-            
-            next_index = index + 1
-            if next_index < len(domande):
-                cl.user_session.set("current_question_index", next_index)
-                await cl.Message(content=f"---\n**Domanda {next_index + 1}:** {domande[next_index]}").send()
-            else:
-                dati_finali = {
-                    "azienda": cl.user_session.get("azienda"),
-                    "target_system": cl.user_session.get("sistema"),
-                    "dati_raccolti": risposte
-                }
-                print("\n" + "="*50 + "\n💾 [DB PREP]\n" + json.dumps(dati_finali, indent=4) + "\n" + "="*50)
-                await cl.Message(content="🎉 **Intervista completata!** Tutti i dati sono stati raccolti e salvati a sistema.").send()
+            if status == "clarification" or status == "invalid":
+                # The bot explains the concept or asks to elaborate
+                await cl.Message(content=f"💡 {response_message}").send()
+                # Re-ask the current question
+                await cl.Message(content=f"---\n**Getting back to our setup:** {current_question}").send()
                 
-        else:
-            await cl.Message(content=f"❌ *Risposta non valida:* {feedback}\n\n**Riprova:** {domanda_corrente}").send()
+            elif status == "success":
+                # Validation passed. Save the extracted answers (can be 1 or more)
+                for q, a in extracted_data.items():
+                    if q in pending_questions:
+                        answers[q] = a
+                        await cl.Message(content=f"✅ *Saved:* **{q}** \n> {a}").send()
+                
+                cl.user_session.set("answers", answers)
+                # Give the feedback message generated by the LLM
+                await cl.Message(content=response_message).send()
+                
+                # Move to the next question
+                await ask_next_question()
+                
+            else:
+                await cl.Message(content="⚠️ Error in processing. Please try again.").send()
+
+        except json.JSONDecodeError:
+            await cl.Message(content="⚠️ *The server responded in an unexpected format. Please try again.*").send()
+
+
+# ==========================================
+# CALLBACK: Target Type Selection
+# ==========================================
+@cl.action_callback("choose_type")
+async def on_choose_type(action: cl.Action):
+    system_type = action.payload.get("value")
+    cl.user_session.set("system_type", system_type)
+    
+    file_excel = "Obiettivi AI - Target Systems.xlsx"
+    await cl.Message(content=f"📂 Reading sheet **{system_type}** from the Excel file...").send()
+    
+    questions = load_questions_from_excel(file_excel, system_type)
+    cl.user_session.set("questions", questions)
+    cl.user_session.set("step", "conversational_chat")
+    
+    await ask_next_question()
+
+
+# ==========================================
+# FUNCTION: Asks the next question dynamically
+# ==========================================
+async def ask_next_question():
+    questions = cl.user_session.get("questions")
+    answers = cl.user_session.get("answers")
+    
+    pending_questions = [q for q in questions if q not in answers or not answers[q]]
+    
+    if not pending_questions:
+        final_data = {
+            "company": cl.user_session.get("company"),
+            "target_system": cl.user_session.get("system"),
+            "system_type": cl.user_session.get("system_type"),
+            "collected_data": answers
+        }
+        print("\n" + "="*50 + "\n💾 [DB PREP]\n" + json.dumps(final_data, indent=4) + "\n" + "="*50)
+        await cl.Message(
+            content="🎉 **Interview completed.** We have successfully gathered all the necessary technical requirements.\n\nThe data has been securely saved to our system. Thank you for your time."
+        ).send()
+        return
+
+    # Take the next question to ask
+    target_question = pending_questions[0]
+    
+    async with cl.Step(name="Question Generation"):
+        # PROMPT AGGIORNATO: Tono professionale, formale e da consulente B2B
+        system_prompt_ask = f"""You are a Senior Technical Consultant conducting a formal IAM integration assessment with a corporate client.
+You must ask the client the following technical question: "{target_question}"
+
+INSTRUCTIONS:
+- Rephrase the question in a highly professional, polite, and formal B2B tone.
+- Be precise and clear.
+- Do NOT use informal greetings (e.g., "Hey", "Hi", "Just checking").
+- You may politely indicate that you are available to clarify the technical concepts if necessary (e.g., "Should you require any clarification regarding this requirement, please let me know.").
+- Ask only this single question. Do not combine multiple questions."""
+
+        conversational_question = call_kong_llm(user_message="", system_prompt=system_prompt_ask)
+    
+    await cl.Message(content=f"💬 {conversational_question}").send()
