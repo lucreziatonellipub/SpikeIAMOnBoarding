@@ -37,6 +37,12 @@ source venv/bin/activate
 
 ```
 
+Se necessario, attivare l'esecuzione di script: 
+
+```bash
+set-executionpolicy unrestricted -scope process
+```
+
 *(Nota: saprai che il venv è attivo quando vedrai `(venv)` all'inizio della riga di comando).*
 
 ### 3. Installa le dipendenze
@@ -55,10 +61,33 @@ KONG_URL=https://il-tuo-kong-url.com/api/v1/chat/completions
 KONG_API_KEY=la_tua_api_key_segreta
 ```
 
-### 5. Avvia l'applicazione
+### 5. Installa il DB
+
+#### a. Installa Docker Desktop (https://www.docker.com/products/docker-desktop/).
+#### b. Avvia PostgreSQL in Docker e crea il DB
 
 ```bash
-chainlit run main.py -w
+docker run --name postgres-local ^
+  -e POSTGRES_PASSWORD=mypass ^
+  -e POSTGRES_DB=iam_onboarding_db ^
+  -p 5432:5432 ^
+  -d postgres:16
+```
+
+#### c. Il container deve essere running perchè il DB funzioni -> apri Docker Desktop per sapere se è running
+
+#### d. Inserisci la password del tuo utente postgres sul file database.py
+
+#### e. Crea le tabelle del DB
+
+```bash
+python create_tables.py
+```
+
+### 6. Avvia l'applicazione
+
+```bash
+chainlit run app.py -w
 
 ```
 
