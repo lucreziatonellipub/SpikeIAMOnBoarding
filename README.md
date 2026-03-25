@@ -57,8 +57,7 @@ pip install -r requirements.txt
 Crea un file `.env` nella directory principale del progetto (il file è ignorato da git per sicurezza) e inserisci le tue credenziali:
 
 ```env
-KONG_URL=https://il-tuo-kong-url.com/api/v1/chat/completions
-KONG_API_KEY=la_tua_api_key_segreta
+AZURE_API_KEY=la_tua_api_key_segreta
 ```
 
 ### 5. Installa il DB

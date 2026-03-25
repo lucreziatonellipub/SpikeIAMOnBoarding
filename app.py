@@ -10,30 +10,42 @@ load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
-# SECTION 1: Custom Kong API Configuration
+# SECTION 1: Azure OpenAI Configuration
 # ==========================================
-def call_kong_llm(user_message: str, system_prompt: str = "") -> str:
-    kong_url = os.getenv("KONG_URL")
-    api_key = os.getenv("KONG_API_KEY")
+def call_azure_llm(user_message: str, system_prompt: str = "") -> str:
+    azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
+    api_key = os.getenv("AZURE_API_KEY") 
     
-    if not kong_url or not api_key:
-        return '{"status": "error", "message": "Error: Missing KONG_URL or KONG_API_KEY"}'
+    if not api_key:
+        return '{"status": "error", "message": "Error: Missing AZURE_API_KEY"}'
 
-    headers = {"api-key": api_key}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
     payload = {
-        "messages": [
+        "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        "temperature": 0.0
+        "model": "gpt-5.4-mini"
     }
     
     try:
-        response = requests.post(kong_url, headers=headers, json=payload, verify=False)
+        response = requests.post(azure_url, headers=headers, json=payload, verify=False)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        
+        response_data = response.json()
+        
+        # 👇 ECCO LA RIGA CORRETTA CON LA NUOVA STRUTTURA DEL JSON 👇
+        return response_data["output"][0]["content"][0]["text"]
+        
     except Exception as e:
-        return json.dumps({"status": "error", "message": f"API Error: {str(e)}"})
+        error_details = str(e)
+        if 'response' in locals() and response.text:
+            error_details += f" | Response: {response.text}"
+        return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
 
 
 # ==========================================
@@ -145,8 +157,8 @@ REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
 }}
 Note: "extracted_data" must be populated ONLY if status is "success"."""
 
-            analysis_str = call_kong_llm(user_message=message.content, system_prompt=system_prompt_orchestrator)
-        
+            analysis_str = call_azure_llm(user_message=message.content, system_prompt=system_prompt_orchestrator)
+            print(f"\n--- DEBUG RISPOSTA API ---\n{analysis_str}\n--------------------------\n")
         try:
             clean_json = analysis_str.replace("```json", "").replace("```", "").strip()
             analysis = json.loads(clean_json)
@@ -178,7 +190,7 @@ Note: "extracted_data" must be populated ONLY if status is "success"."""
                 await ask_next_question(last_user_input=message.content)
                 
             else:
-                await cl.Message(content="⚠️ Error in processing. Please try again.").send()
+                await cl.Message(content=f"⚠️ API Error Details: {response_message}").send()
 
         except json.JSONDecodeError:
             await cl.Message(content="⚠️ *The server responded in an unexpected format. Please try again.*").send()
@@ -226,7 +238,7 @@ CRITICAL: DO NOT translate or modify the keys (the questions).
 Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown, no greetings."""
 
             # Passiamo il dizionario delle risposte all'LLM convertendolo in stringa JSON
-            translation_response = call_kong_llm(
+            translation_response = call_azure_llm(
                 user_message=json.dumps(answers, ensure_ascii=False), 
                 system_prompt=system_prompt_translate
             )
@@ -282,7 +294,7 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
     "conversational_question": "Your rephrased, professional B2B question"
 }}"""
 
-        response_str = call_kong_llm(user_message="", system_prompt=system_prompt_ask)
+        response_str = call_azure_llm(user_message="", system_prompt=system_prompt_ask)
         
         try:
             clean_json = response_str.replace("```json", "").replace("```", "").strip()
