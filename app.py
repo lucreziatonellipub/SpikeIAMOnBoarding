@@ -5,6 +5,8 @@ import json
 import urllib3
 import os
 from dotenv import load_dotenv
+from database import get_db
+from models import OnboardingSession
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -222,14 +224,14 @@ async def ask_next_question(last_user_input: str = ""):
     questions = cl.user_session.get("questions")
     answers = cl.user_session.get("answers")
     
+    # Calcola quali domande mancano all'appello
     pending_questions = [q for q in questions if q not in answers or not answers[q]]
     
-    # --- BLOCCO DI FINE INTERVISTA E TRADUZIONE ---
+    # --- BLOCCO 1: FINE INTERVISTA, TRADUZIONE E SALVATAGGIO DB ---
     if not pending_questions:
         translated_answers = {}
         
         async with cl.Step(name="Elaborazione e Traduzione Dati"):
-            # Chiediamo all'LLM di tradurre i valori (le risposte) mantenendo intatte le chiavi (le domande)
             system_prompt_translate = """You are an expert IT technical translator. 
 I will provide a JSON dictionary containing questions as keys and user answers as values.
 Your task is to translate ALL the values (the answers) into professional IT English.
@@ -237,42 +239,56 @@ If a value is already in English, keep it exactly as it is.
 CRITICAL: DO NOT translate or modify the keys (the questions).
 Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown, no greetings."""
 
-            # Passiamo il dizionario delle risposte all'LLM convertendolo in stringa JSON
+            # Chiamata all'LLM di Azure per la traduzione
             translation_response = call_azure_llm(
                 user_message=json.dumps(answers, ensure_ascii=False), 
                 system_prompt=system_prompt_translate
             )
             
             try:
-                # Pulizia della risposta e caricamento del JSON tradotto
                 clean_json = translation_response.replace("```json", "").replace("```", "").strip()
                 translated_answers = json.loads(clean_json)
             except Exception as e:
                 print(f"Errore durante la traduzione: {e}")
                 translated_answers = {"error": "Traduzione fallita", "raw_response": translation_response}
 
-        # Prepariamo il payload finale per il Database
-        final_data = {
-            "company": cl.user_session.get("company"),
-            "target_system": cl.user_session.get("system"),
-            "system_type": cl.user_session.get("system_type"),
-            "collected_data_original": answers,
-            "collected_data_english": translated_answers
-        }
+        # Prepariamo i dati dalla sessione per il salvataggio
+        company_name = cl.user_session.get("company")
+        target_system_name = cl.user_session.get("system")
+        system_type_name = cl.user_session.get("system_type")
+
+        print("\n" + "="*50 + "\n💾 [SALVATAGGIO NEL DATABASE IN CORSO...]\n" + "="*50)
         
-        print("\n" + "="*50 + "\n💾 [DB PREP]\n" + json.dumps(final_data, indent=4) + "\n" + "="*50)
-        
+        try:
+            # Apriamo la connessione al DB e salviamo il record
+            with get_db() as db:
+                nuova_sessione = OnboardingSession(
+                    company=company_name,
+                    target_system=target_system_name,
+                    system_type=system_type_name,
+                    collected_data_original=answers,
+                    collected_data_english=translated_answers
+                )
+                db.add(nuova_sessione)
+                db.commit()
+                print(f"✅ Dati salvati con successo per la company: {company_name}")
+                
+        except Exception as e:
+            print(f"❌ Errore critico durante il salvataggio nel DB: {e}")
+
+        # Messaggio finale all'utente
         await cl.Message(
             content="🎉 **Interview completed.** We have successfully gathered all the necessary technical requirements.\n\nThe data has been securely saved to our system. Thank you for your time."
         ).send()
-        return
+        
+        return # Termina l'esecuzione della funzione qui
 
-    # --- DA QUI IN POI IL CODICE RESTA UGUALE ---
+    # --- BLOCCO 2: SELEZIONE E INVIO DELLA PROSSIMA DOMANDA ---
+    
     # Creiamo un dizionario numerato per evitare che l'LLM sbagli a copiare le stringhe
     numbered_pending = {str(i): q for i, q in enumerate(pending_questions)}
 
     async with cl.Step(name="Contextual Question Selection"):
-        # PROMPT MIGLIORATO: Usa gli indici numerici e forza il ragionamento logico sui topic
         system_prompt_ask = f"""You are a Senior Technical Consultant conducting a formal IAM integration assessment.
 
 PREVIOUS CONTEXT / LAST USER MESSAGE:
@@ -294,6 +310,7 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
     "conversational_question": "Your rephrased, professional B2B question"
 }}"""
 
+        # Chiamata all'LLM di Azure per selezionare la prossima domanda
         response_str = call_azure_llm(user_message="", system_prompt=system_prompt_ask)
         
         try:
@@ -314,7 +331,8 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
             target_question = pending_questions[0]
             conversational_question = f"Could you please elaborate on the following requirement: {target_question}"
 
-    # SALVIAMO IN SESSIONE LA DOMANDA CHE L'LLM HA SCELTO
+    # Salva in sessione la domanda esatta che stiamo per fare
     cl.user_session.set("current_asked_question", target_question)
     
+    # Invia la domanda all'utente
     await cl.Message(content=f"💬 {conversational_question}").send()

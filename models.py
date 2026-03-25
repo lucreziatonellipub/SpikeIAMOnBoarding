@@ -1,13 +1,16 @@
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, JSON, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
 
 Base = declarative_base()
 
-class OnboardingAnswer(Base):
-    __tablename__ = "OnboardingAnswers"
+class OnboardingSession(Base):
+    __tablename__ = "onboarding_sessions"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    customer = Column(String)
+    id = Column(Integer, primary_key=True, index=True)
+    company = Column(String, index=True)
     target_system = Column(String)
-    question = Column(String)
-    answer = Column(String)
+    system_type = Column(String)
+    collected_data_original = Column(JSON) # Salva dizionari Python come JSON
+    collected_data_english = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)

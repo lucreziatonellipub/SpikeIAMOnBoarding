@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16
+    container_name: postgres-local
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mypass}
+      POSTGRES_DB: ${DB_NAME:-iam_onboarding_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Tool visivo leggero per esplorare il DB
+  adminer:
+    image: adminer
+    container_name: adminer-local
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
