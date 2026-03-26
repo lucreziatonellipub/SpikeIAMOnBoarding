@@ -14,3 +14,10 @@ class OnboardingSession(Base):
     collected_data_original = Column(JSON) # Salva dizionari Python come JSON
     collected_data_english = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class Question(Base):
+    __tablename__ = "question"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(String, index=True)
+    system_type = Column(String)

@@ -114,6 +114,55 @@ async def main(message: cl.Message):
     # --- EXTRA CHECK: User types instead of clicking the button ---
     elif step == "system_type":
         await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send()
+# --- EXTRA CHECK: User types instead of clicking the button (per la scelta del metodo) ---
+    elif step == "choose_method":
+        await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
+
+    # --- STEP 3A: Gestione dell'Upload Excel ---
+    elif step == "upload_excel":
+        if not message.elements:
+            await cl.Message(content="⚠️ Please upload the completed Excel file using the attachment button (📎).").send()
+            return
+            
+        file = message.elements[0]
+        system_type = cl.user_session.get("system_type")
+        
+        try:
+            # Leggiamo il file caricato dall'utente
+            df = pd.read_excel(file.path, sheet_name=system_type)
+            
+            # Verifichiamo che l'utente abbia creato la colonna 'Risposta'
+            if 'Risposta' not in df.columns:
+                await cl.Message(content="⚠️ Cannot find the column **'Risposta'** in your uploaded file. Please add it, fill in your answers, and upload it again.").send()
+                return
+                
+            answers = cl.user_session.get("answers")
+            questions = cl.user_session.get("questions")
+            
+            # Estraiamo le risposte e le salviamo in memoria
+            extracted_count = 0
+            for index, row in df.iterrows():
+                q = str(row.get('Domanda', ''))
+                a = row.get('Risposta')
+                
+                # Se la domanda fa parte di quelle previste e c'è una risposta valida
+                if q in questions and pd.notna(a) and str(a).strip():
+                    answers[q] = str(a).strip()
+                    extracted_count += 1
+                    
+            cl.user_session.set("answers", answers)
+            
+            await cl.Message(content=f"✅ **File processed successfully!** Extracted {extracted_count} answers.").send()
+            
+            # Cambiamo lo step a chat e chiamiamo la funzione di valutazione finale
+            cl.user_session.set("step", "conversational_chat")
+            
+            # Se ha risposto a tutto, questo attiverà il salvataggio su DB.
+            # Se ha dimenticato qualcosa, l'LLM farà le domande mancanti!
+            await ask_next_question(last_user_input="I have uploaded the Excel file. Please review.")
+            
+        except Exception as e:
+            await cl.Message(content=f"⚠️ Error reading the file. Ensure it's a valid Excel format. Error details: {str(e)}").send()
 
     # --- STEP 3: Conversational Chat (Extraction, Validation, Explanation, CORRECTION) ---
     elif step == "conversational_chat":
@@ -207,15 +256,54 @@ async def on_choose_type(action: cl.Action):
     cl.user_session.set("system_type", system_type)
     
     file_excel = "Obiettivi AI - Target Systems.xlsx"
-    await cl.Message(content=f"📂 Reading sheet **{system_type}** from the Excel file...").send()
-    
     questions = load_questions_from_excel(file_excel, system_type)
     cl.user_session.set("questions", questions)
-    cl.user_session.set("step", "conversational_chat")
     
-    # Primo avvio, non c'è contesto precedente
-    await ask_next_question(last_user_input="")
+    # Invece di iniziare la chat, cambiamo lo step per far scegliere il metodo
+    cl.user_session.set("step", "choose_method")
+    
+    actions = [
+        cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
+        cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel")
+    ]
+    
+    await cl.Message(
+        content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
+        actions=actions
+    ).send()
 
+# ==========================================
+# CALLBACK: Method Selection (Chat vs Excel)
+# ==========================================
+@cl.action_callback("choose_method")
+async def on_choose_method(action: cl.Action):
+    method = action.payload.get("value")
+    
+    if method == "chat":
+        cl.user_session.set("step", "conversational_chat")
+        await ask_next_question(last_user_input="")
+        
+    elif method == "excel":
+        cl.user_session.set("step", "upload_excel")
+        
+        # Inviamo il file Excel esistente all'utente
+        elements = [
+            cl.File(
+                name="Obiettivi AI - Target Systems.xlsx",
+                path="Obiettivi AI - Target Systems.xlsx", # Il tuo file locale
+                display="inline"
+            )
+        ]
+        
+        await cl.Message(
+            content="📥 **Please download the Excel file attached above.**\n\n"
+                    "**Instructions:**\n"
+                    "1. Open the sheet corresponding to your system (**" + cl.user_session.get("system_type") + "**).\n"
+                    "2. Add a new column named exactly **Risposta** next to the questions.\n"
+                    "3. Fill in your answers and save the file.\n\n"
+                    "When you are ready, **upload the completed file here** using the attachment button (📎).",
+            elements=elements
+        ).send()
 
 # ==========================================
 # FUNCTION: Asks the next question dynamically

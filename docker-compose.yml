@@ -22,5 +22,16 @@ services:
     depends_on:
       - db
 
+  # app:
+  #     build: .
+  #     container_name: spike-chainlit-app
+  #     ports:
+  #       - "8000:8000"
+  #     volumes:
+  #       - ./:/app
+  #     env_file:
+  #       - .env
+  #     depends_on:
+  #       - db
 volumes:
   pgdata:
