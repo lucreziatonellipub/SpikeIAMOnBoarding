@@ -140,7 +140,7 @@ async def main(message: cl.Message):
 
     # --- EXTRA CHECK: User types instead of clicking the button ---
     elif step == "system_type":
-        await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send()
+        await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send() 
 # --- EXTRA CHECK: User types instead of clicking the button (per la scelta del metodo) ---
     elif step == "choose_method":
         await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
@@ -294,6 +294,12 @@ async def on_choose_type(action: cl.Action):
         cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
         cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel")
     ]
+
+    # Generate excel in local dir
+    # TODO: capire se si può rendere più carino l'excel
+    # TODO: capire se si può passare un df con doppia colonna, così da aggiungere già la colonna "Answer" al posto dell'utente -> bisogna passargli una matrice 2xn domande
+    df = pd.DataFrame(questions, columns=["Question"])
+    df.to_excel("Obiettivi AI - Target Systems.xlsx", index=False)
     
     await cl.Message(
         content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
