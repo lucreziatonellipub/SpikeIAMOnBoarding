@@ -85,6 +85,12 @@ Puoi controllare da Docker Desktop oppure aprendo il browser su `http://localhos
 python create_tables.py
 ```
 
+#### d. Riempi con i primi record le tabelle del DB
+
+```bash
+python seed.py
+```
+
 ### 6. Avvia l'applicazione
 
 ```bash

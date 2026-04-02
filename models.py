@@ -5,7 +5,7 @@ from datetime import datetime
 Base = declarative_base()
 
 class OnboardingSession(Base):
-    __tablename__ = "onboarding_sessions"
+    __tablename__ = "onboarding_session"
 
     id = Column(Integer, primary_key=True, index=True)
     company = Column(String, index=True)
