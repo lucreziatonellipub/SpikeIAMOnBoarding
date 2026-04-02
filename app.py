@@ -6,7 +6,8 @@ import urllib3
 import os
 from dotenv import load_dotenv
 from database import get_db
-from models import OnboardingSession
+from models import Question
+from database import engine, SessionLocal
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -67,9 +68,34 @@ def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
             "What authentication protocol does it use?",
             "Is there a test environment separated from the production one?"
         ]
+    
+# ==========================================
+# SECTION 3: Dynamic DB Reading
+# ==========================================
+def load_questions_from_DB(system_type: str) -> list:
+    try:
+        db = SessionLocal()
+
+        questions_db = db.query(Question).where(Question.system_type == system_type)
+        questions = []
+
+        for r in questions_db:
+            questions.append(r.question)
+
+        db.close()
+
+        return questions
+    except Exception as e:
+        print(f"Error connecting/reading DB: {e}")
+        # Fallback questions in case of error
+        return [
+            "Is the target system exposed to the internet or only available on the intranet?",
+            "What authentication protocol does it use?",
+            "Is there a test environment separated from the production one?"
+        ]
 
 # ==========================================
-# SECTION 3: Initial Flow Management
+# SECTION 4: Initial Flow Management
 # ==========================================
 @cl.on_chat_start
 async def start():
@@ -83,6 +109,7 @@ async def start():
 
 @cl.on_message
 async def main(message: cl.Message):
+
     step = cl.user_session.get("step")
     answers = cl.user_session.get("answers")
     
@@ -255,8 +282,9 @@ async def on_choose_type(action: cl.Action):
     system_type = action.payload.get("value")
     cl.user_session.set("system_type", system_type)
     
-    file_excel = "Obiettivi AI - Target Systems.xlsx"
-    questions = load_questions_from_excel(file_excel, system_type)
+    # file_excel = "Obiettivi AI - Target Systems.xlsx"
+    # questions = load_questions_from_excel(file_excel, system_type)
+    questions = load_questions_from_DB(system_type)
     cl.user_session.set("questions", questions)
     
     # Invece di iniziare la chat, cambiamo lo step per far scegliere il metodo
