@@ -11,12 +11,19 @@ from database import engine, SessionLocal
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+
+import asyncio
+from functools import partial
+					
+from auth import verify_password, load_users
+
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
 # SECTION 1: Azure OpenAI Configuration
 # ==========================================
+"""
 def call_azure_llm(user_message: str, system_prompt: str = "") -> str:
     azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
     api_key = os.getenv("AZURE_API_KEY") 
@@ -51,6 +58,43 @@ def call_azure_llm(user_message: str, system_prompt: str = "") -> str:
         if 'response' in locals() and response.text:
             error_details += f" | Response: {response.text}"
         return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
+"""
+
+
+def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool = False) -> str:
+    azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
+    api_key = os.getenv("AZURE_API_KEY")
+
+    if not api_key:
+        return '{"status": "error", "message": "Error: Missing AZURE_API_KEY"}'
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        "model": "gpt-5.4-mini"
+    }
+
+    if json_mode:
+        payload["text"] = {"format": {"type": "json_object"}}
+
+    try:
+        response = requests.post(azure_url, headers=headers, json=payload, verify=False)
+        response.raise_for_status()
+        return response.json()["output"][0]["content"][0]["text"]
+
+    except Exception as e:
+        error_details = str(e)
+        if 'response' in locals() and response.text:
+            error_details += f" | Response: {response.text}"
+        return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
+
 
 
 # ==========================================
@@ -61,7 +105,7 @@ def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
         df = pd.read_excel(file_path, sheet_name=sheet_name)
         # Assuming the column is still named 'Domanda' in your Excel. 
         # Change to 'Question' if you translate the Excel header too.
-        return df['Domanda'].dropna().tolist()
+        return df['Question'].dropna().tolist()
     except Exception as e:
         print(f"Error reading the Excel file: {e}")
         # Fallback questions in case of error
@@ -95,6 +139,40 @@ def load_questions_from_DB(system_type: str) -> list:
             "What authentication protocol does it use?",
             "Is there a test environment separated from the production one?"
         ]
+
+
+
+
+
+
+
+@cl.password_auth_callback
+def auth_callback(username: str, password: str):
+    users = load_users()
+    print(f"=== LOGIN DEBUG ===")
+    print(f"Username tentato: '{username}'")
+    print(f"Utenti nel file: {list(users.keys())}")
+    print(f"Username trovato: {username in users}")
+
+    if username not in users:
+        print("ERRORE: username non trovato")
+        return None
+
+    is_valid = verify_password(password, users[username])
+    print(f"Password valida: {is_valid}")
+
+    if not is_valid:
+        print("ERRORE: password errata")
+        return None
+
+    print("LOGIN OK")
+    return cl.User(
+        identifier=username,
+        metadata={"role": "user", "provider": "credentials"}
+    )
+
+
+
 
 # ==========================================
 # SECTION 4: Initial Flow Management
@@ -148,50 +226,117 @@ async def main(message: cl.Message):
         await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
 
     # --- STEP 3A: Gestione dell'Upload Excel ---
+
+
     elif step == "upload_excel":
         if not message.elements:
             await cl.Message(content="⚠️ Please upload the completed Excel file using the attachment button (📎).").send()
             return
-            
+
         file = message.elements[0]
         system_type = cl.user_session.get("system_type")
-        
+        answers = cl.user_session.get("answers") or {}
+        questions = cl.user_session.get("questions") or []
+
         try:
-            # Leggiamo il file caricato dall'utente
             df = pd.read_excel(file.path, sheet_name=system_type)
-            
-            # Verifichiamo che l'utente abbia creato la colonna 'Risposta'
-            if 'Risposta' not in df.columns:
-                await cl.Message(content="⚠️ Cannot find the column **'Risposta'** in your uploaded file. Please add it, fill in your answers, and upload it again.").send()
+            df.columns = df.columns.str.strip()
+
+            if 'Answer' not in df.columns:
+                await cl.Message(content="⚠️ Cannot find the column **'Answer'** in your uploaded file. Please add it, fill in your answers, and upload it again.").send()
                 return
-                
-            answers = cl.user_session.get("answers")
-            questions = cl.user_session.get("questions")
-            
-            # Estraiamo le risposte e le salviamo in memoria
-            extracted_count = 0
+
+            normalized_questions = {q.strip(): q for q in questions}
+
+             # DEBUG
+            print("normalized_questions keys:", list(normalized_questions.keys())[:3])
+
+            rows_to_validate = []
             for index, row in df.iterrows():
-                q = str(row.get('Domanda', ''))
-                a = row.get('Risposta')
-                
-                # Se la domanda fa parte di quelle previste e c'è una risposta valida
-                if q in questions and pd.notna(a) and str(a).strip():
-                    answers[q] = str(a).strip()
+                q_raw = str(row.get('Question', '')).strip()
+                a = row.get('Answer')
+
+                # DEBUG
+                print(f"Row {index} | q_raw: '{q_raw}' | in normalized: {q_raw in normalized_questions} | a: '{a}'")
+
+                if q_raw not in normalized_questions:
+                    continue
+                if not pd.notna(a) or not str(a).strip():
+                    continue
+                rows_to_validate.append((q_raw, normalized_questions[q_raw], str(a).strip()))
+
+            await cl.Message(content=f"🔄 Validating **{len(rows_to_validate)}** answers in parallel, please wait...").send()
+
+            def validate_single(q_raw: str, answer_text: str) -> dict:
+                validation_prompt = f"""You are an expert IAM technical consultant reviewing onboarding questionnaire answers.
+
+QUESTION: "{q_raw}"
+ANSWER: "{answer_text}"
+
+Your task: decide if this answer provides ANY useful information to the question, even if incomplete or misspelled.
+Accept it unless it is completely meaningless or a clear refusal.
+
+Reply ONLY with valid JSON:
+{{
+    "valid": true | false,
+    "reason": "One sentence explanation in English"
+}}
+"""
+                validation_str = call_azure_llm(user_message="", system_prompt=validation_prompt, json_mode=True)
+                try:
+                    clean = validation_str.replace("```json", "").replace("```", "").strip()
+                    result = json.loads(clean)
+                    return {
+                        "question": q_raw,
+                        "valid": result.get("valid", False),
+                        "reason": result.get("reason", "No reason provided.")
+                    }
+                except Exception:
+                    return {
+                        "question": q_raw,
+                        "valid": False,
+                        "reason": f"Could not parse response: {validation_str[:200]}"
+                    }
+
+            loop = asyncio.get_event_loop()
+            tasks = [
+                loop.run_in_executor(None, validate_single, q_raw, answer_text)
+                for q_raw, original_key, answer_text in rows_to_validate
+            ]
+            results = await asyncio.gather(*tasks)
+
+            extracted_count = 0
+            invalid_answers = []
+
+            for i, validation_result in enumerate(results):
+                q_raw, original_key, answer_text = rows_to_validate[i]
+                if validation_result["valid"]:
+                    answers[original_key] = answer_text
                     extracted_count += 1
-                    
+                else:
+                    invalid_answers.append({
+                        "question": q_raw,
+                        "answer": answer_text,
+                        "reason": validation_result["reason"]
+                    })
+
             cl.user_session.set("answers", answers)
-            
-            await cl.Message(content=f"✅ **File processed successfully!** Extracted {extracted_count} answers.").send()
-            
-            # Cambiamo lo step a chat e chiamiamo la funzione di valutazione finale
+
+            await cl.Message(content=f"✅ **File processed successfully!** Extracted **{extracted_count}** valid answers.").send()
+
+            if invalid_answers:
+                warning_lines = ["⚠️ **The following answers were flagged as insufficient and skipped:**\n"]
+                for item in invalid_answers:
+                    warning_lines.append(f"- **Q:** {item['question']}\n  **A:** {item['answer']}\n  **Reason:** {item['reason']}")
+                await cl.Message(content="\n\n".join(warning_lines)).send()
+
             cl.user_session.set("step", "conversational_chat")
-            
-            # Se ha risposto a tutto, questo attiverà il salvataggio su DB.
-            # Se ha dimenticato qualcosa, l'LLM farà le domande mancanti!
             await ask_next_question(last_user_input="I have uploaded the Excel file. Please review.")
-            
+
         except Exception as e:
             await cl.Message(content=f"⚠️ Error reading the file. Ensure it's a valid Excel format. Error details: {str(e)}").send()
+
+
 
     # --- STEP 3: Conversational Chat (Extraction, Validation, Explanation, CORRECTION) ---
     elif step == "conversational_chat":
@@ -380,7 +525,7 @@ async def on_choose_method(action: cl.Action):
             content="📥 **Please download the Excel file attached above.**\n\n"
                     "**Instructions:**\n"
                     "1. Open the sheet corresponding to your system (**" + cl.user_session.get("system_type") + "**).\n"
-                    "2. Add a new column named exactly **Risposta** next to the questions.\n"
+                    "2. Add a new column named exactly **Answer** next to the questions.\n"
                     "3. Fill in your answers and save the file.\n\n"
                     "When you are ready, **upload the completed file here** using the attachment button (📎).",
             elements=elements
