@@ -1,0 +1,2388 @@
+
+
+# admin_dashboard.py
+# Spike IAM Onboarding - Admin Dashboard
+# A complete Flask-based admin dashboard for managing onboarding questions
+# and viewing interview sessions. Features dark Chainlit-like theme,
+# full CRUD for questions, and interview viewer with filtering.
+#
+# Usage:
+#   python admin_dashboard.py
+#
+# Docker Compose service example:
+#   # admin-dashboard:
+#   #   build: .
+#   #   command: python admin_dashboard.py
+#   #   ports:
+#   #     - "5001:5001"
+#   #   environment:
+#   #     - ADMIN_PASSWORD=spike2025
+#   #     - DATABASE_URL=sqlite:///./onboarding.db
+#   #   volumes:
+#   #     - ./data:/app/data
+#   #   depends_on:
+#   #     - db
+
+import os
+import json
+from datetime import datetime
+from functools import wraps
+
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    session,
+    jsonify,
+    render_template_string,
+    flash,
+)
+from sqlalchemy import or_
+
+from database import get_db
+from models import OnboardingSession, Question, Base
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "spike2025")
+SECRET_KEY = os.getenv("SECRET_KEY", "spike-admin-secret-key-change-in-prod")
+SYSTEM_TYPES = ["Generic", "AD-Azure", "Target DB", "SAP"]
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# ---------------------------------------------------------------------------
+# Authentication decorator
+# ---------------------------------------------------------------------------
+
+def login_required(f):
+    """Decorator that redirects unauthenticated users to the login page."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get("authenticated"):
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ---------------------------------------------------------------------------
+# Base HTML template – full shell with sidebar, nav, content area, toasts
+# ---------------------------------------------------------------------------
+
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_title | default('Spike IAM Admin') }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* ============================================================
+           CSS Reset & Variables
+           ============================================================ */
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0f0f23;
+            --bg-secondary: #1a1a2e;
+            --bg-card: #1e1e3f;
+            --bg-card-hover: #252550;
+            --bg-input: #16163a;
+            --accent: #7c3aed;
+            --accent-hover: #6d28d9;
+            --accent-light: #a78bfa;
+            --accent-glow: rgba(124, 58, 237, 0.3);
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --border: #2d2d5e;
+            --border-light: #3d3d7e;
+            --success: #10b981;
+            --success-bg: rgba(16, 185, 129, 0.15);
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.15);
+            --danger-hover: #dc2626;
+            --warning: #f59e0b;
+            --warning-bg: rgba(245, 158, 11, 0.15);
+            --info: #3b82f6;
+            --info-bg: rgba(59, 130, 246, 0.15);
+            --sidebar-width: 260px;
+            --header-height: 64px;
+            --radius: 12px;
+            --radius-sm: 8px;
+            --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+            --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4);
+            --transition: all 0.2s ease;
+        }
+
+        html {
+            font-size: 16px;
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        a {
+            color: var(--accent-light);
+            text-decoration: none;
+            transition: var(--transition);
+        }
+
+        a:hover {
+            color: var(--accent);
+        }
+
+        /* ============================================================
+           Sidebar
+           ============================================================ */
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            z-index: 100;
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-height: var(--header-height);
+        }
+
+        .sidebar-logo {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar-logo .logo-icon {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, var(--accent), #a78bfa);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+        }
+
+        .sidebar-nav {
+            flex: 1;
+            padding: 16px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .nav-section-title {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            padding: 12px 12px 6px;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 11px 16px;
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+        }
+
+        .nav-item:hover {
+            background: rgba(124, 58, 237, 0.1);
+            color: var(--text-primary);
+        }
+
+        .nav-item.active {
+            background: rgba(124, 58, 237, 0.18);
+            color: var(--accent-light);
+        }
+
+        .nav-item .nav-icon {
+            font-size: 1.2rem;
+            width: 24px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+
+        .sidebar-footer {
+            padding: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+        .logout-btn {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 11px 16px;
+            border-radius: var(--radius-sm);
+            color: var(--danger);
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+            width: 100%;
+            background: none;
+            border: none;
+            font-family: inherit;
+        }
+
+        .logout-btn:hover {
+            background: var(--danger-bg);
+            color: var(--danger);
+        }
+
+        /* ============================================================
+           Main Content Area
+           ============================================================ */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .top-bar {
+            height: var(--header-height);
+            padding: 0 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+            position: sticky;
+            top: 0;
+            z-index: 50;
+        }
+
+        .top-bar h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .top-bar-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .content-area {
+            flex: 1;
+            padding: 32px;
+        }
+
+        /* ============================================================
+           Cards
+           ============================================================ */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: var(--shadow);
+            transition: var(--transition);
+        }
+
+        .card:hover {
+            border-color: var(--border-light);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .card-header h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .card-header h3 {
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 18px;
+            border: none;
+            border-radius: var(--radius-sm);
+            font-family: inherit;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+            line-height: 1.4;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+            box-shadow: 0 0 20px var(--accent-glow);
+            color: white;
+        }
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-card-hover);
+            color: var(--text-primary);
+        }
+
+        .btn-danger {
+            background: var(--danger-bg);
+            color: var(--danger);
+            border: 1px solid transparent;
+        }
+
+        .btn-danger:hover {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-success {
+            background: var(--success-bg);
+            color: var(--success);
+            border: 1px solid transparent;
+        }
+
+        .btn-success:hover {
+            background: var(--success);
+            color: white;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 0.8rem;
+        }
+
+        .btn-icon {
+            padding: 8px;
+            width: 36px;
+            height: 36px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* ============================================================
+           Forms & Inputs
+           ============================================================ */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            transition: var(--transition);
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .form-control::placeholder {
+            color: var(--text-muted);
+        }
+
+        select.form-control {
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 36px;
+            cursor: pointer;
+        }
+
+        textarea.form-control {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        /* ============================================================
+           Tables
+           ============================================================ */
+        .table-container {
+            overflow-x: auto;
+            border-radius: var(--radius-sm);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead th {
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 0.78rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            background: var(--bg-input);
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+
+        tbody td {
+            padding: 12px 16px;
+            font-size: 0.9rem;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        tbody tr {
+            transition: var(--transition);
+        }
+
+        tbody tr:hover {
+            background: rgba(124, 58, 237, 0.06);
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        /* ============================================================
+           Tabs
+           ============================================================ */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 24px;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            border: none;
+            background: none;
+            color: var(--text-muted);
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            position: relative;
+            transition: var(--transition);
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+
+        .tab:hover {
+            color: var(--text-secondary);
+        }
+
+        .tab.active {
+            color: var(--accent-light);
+            border-bottom-color: var(--accent);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* ============================================================
+           Badges
+           ============================================================ */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .badge-generic {
+            background: var(--info-bg);
+            color: var(--info);
+        }
+
+        .badge-ad-azure {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+
+        .badge-target-db {
+            background: var(--warning-bg);
+            color: var(--warning);
+        }
+
+        .badge-sap {
+            background: rgba(236, 72, 153, 0.15);
+            color: #ec4899;
+        }
+
+        /* ============================================================
+           Modal
+           ============================================================ */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 28px;
+            width: 90%;
+            max-width: 520px;
+            box-shadow: var(--shadow-lg);
+            animation: modalIn 0.2s ease;
+        }
+
+        @keyframes modalIn {
+            from {
+                opacity: 0;
+                transform: scale(0.95) translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: scale(1) translateY(0);
+            }
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.4rem;
+            cursor: pointer;
+            padding: 4px;
+            transition: var(--transition);
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+        /* ============================================================
+           Toast Notifications
+           ============================================================ */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 20px;
+            border-radius: var(--radius-sm);
+            font-size: 0.875rem;
+            font-weight: 500;
+            box-shadow: var(--shadow-lg);
+            animation: toastIn 0.3s ease, toastOut 0.3s ease 3.7s forwards;
+            max-width: 380px;
+        }
+
+        .toast-success {
+            background: var(--bg-card);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .toast-error {
+            background: var(--bg-card);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+        }
+
+        .toast-info {
+            background: var(--bg-card);
+            border: 1px solid var(--info);
+            color: var(--info);
+        }
+
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateX(40px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        @keyframes toastOut {
+            from { opacity: 1; transform: translateX(0); }
+            to { opacity: 0; transform: translateX(40px); }
+        }
+
+        /* ============================================================
+           Stats Cards
+           ============================================================ */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 32px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            transition: var(--transition);
+        }
+
+        .stat-card:hover {
+            border-color: var(--accent);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px var(--accent-glow);
+        }
+
+        .stat-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+            flex-shrink: 0;
+        }
+
+        .stat-icon.purple { background: rgba(124, 58, 237, 0.15); }
+        .stat-icon.blue { background: var(--info-bg); }
+        .stat-icon.green { background: var(--success-bg); }
+        .stat-icon.orange { background: var(--warning-bg); }
+
+        .stat-info h3 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .stat-info p {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        /* ============================================================
+           Filter Bar
+           ============================================================ */
+        .filter-bar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+
+        .filter-bar .form-group {
+            margin-bottom: 0;
+            flex: 1;
+            min-width: 160px;
+        }
+
+        .filter-bar .form-group.search-group {
+            flex: 2;
+        }
+
+        /* ============================================================
+           Interview Detail (expandable row / card)
+           ============================================================ */
+        .interview-detail {
+            display: none;
+            padding: 0;
+        }
+
+        .interview-detail.active {
+            display: table-row;
+        }
+
+        .interview-detail td {
+            padding: 0;
+        }
+
+        .detail-content {
+            padding: 20px 24px 24px;
+            background: var(--bg-input);
+            border-bottom: 2px solid var(--accent);
+        }
+
+        .qa-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 16px;
+        }
+
+        .qa-column h4 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--accent-light);
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .qa-pair {
+            margin-bottom: 14px;
+            padding: 12px;
+            background: var(--bg-card);
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+        }
+
+        .qa-pair .qa-question {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .qa-pair .qa-answer {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .detail-meta {
+            display: flex;
+            gap: 24px;
+            padding: 12px 0;
+            flex-wrap: wrap;
+        }
+
+        .detail-meta-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .detail-meta-item strong {
+            color: var(--text-secondary);
+        }
+
+        .clickable-row {
+            cursor: pointer;
+        }
+
+        .clickable-row:hover {
+            background: rgba(124, 58, 237, 0.1) !important;
+        }
+
+        /* ============================================================
+           Empty State
+           ============================================================ */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: var(--text-muted);
+        }
+
+        .empty-state .empty-icon {
+            font-size: 3rem;
+            margin-bottom: 16px;
+        }
+
+        .empty-state h3 {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+
+        .empty-state p {
+            font-size: 0.9rem;
+        }
+
+        /* ============================================================
+           Inline Edit
+           ============================================================ */
+        .inline-edit-input {
+            background: var(--bg-input);
+            border: 1px solid var(--accent);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            padding: 6px 10px;
+            width: 100%;
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .inline-edit-input:focus {
+            outline: none;
+        }
+
+        /* ============================================================
+           Scrollbar
+           ============================================================ */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-primary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--border-light);
+        }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: none;
+            color: var(--text-primary);
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 4px;
+        }
+
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+            }
+
+            .mobile-menu-btn {
+                display: block;
+            }
+
+            .content-area {
+                padding: 20px 16px;
+            }
+
+            .qa-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .filter-bar {
+                flex-direction: column;
+            }
+
+            .filter-bar .form-group {
+                width: 100%;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-logo">
+                <div class="logo-icon">⚡</div>
+                <span>Spike IAM</span>
+            </div>
+        </div>
+        <nav class="sidebar-nav">
+            <div class="nav-section-title">Dashboard</div>
+            <a href="{{ url_for('dashboard') }}" class="nav-item {{ 'active' if active_page == 'dashboard' else '' }}">
+                <span class="nav-icon">📊</span>
+                <span>Overview</span>
+            </a>
+            <div class="nav-section-title">Management</div>
+            <a href="{{ url_for('questions_page') }}" class="nav-item {{ 'active' if active_page == 'questions' else '' }}">
+                <span class="nav-icon">❓</span>
+                <span>Questions</span>
+            </a>
+            <a href="{{ url_for('interviews_page') }}" class="nav-item {{ 'active' if active_page == 'interviews' else '' }}">
+                <span class="nav-icon">💬</span>
+                <span>Interviews</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <a href="{{ url_for('logout') }}" class="logout-btn">
+                <span class="nav-icon">🚪</span>
+                <span>Logout</span>
+            </a>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <header class="top-bar">
+            <div style="display:flex;align-items:center;gap:12px;">
+                <button class="mobile-menu-btn" onclick="toggleSidebar()">☰</button>
+                <h1>{{ page_title | default('Dashboard') }}</h1>
+            </div>
+            <div class="top-bar-actions">
+                <span style="font-size:0.85rem;color:var(--text-muted);">Admin Panel</span>
+            </div>
+        </header>
+
+        <div class="content-area">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Global JavaScript -->
+    <script>
+        // Toggle mobile sidebar
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        // Show toast notification
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+            toast.className = 'toast toast-' + type;
+            toast.innerHTML = '<span>' + (icons[type] || '') + '</span><span>' + escapeHtml(message) + '</span>';
+            container.appendChild(toast);
+            setTimeout(() => {
+                if (toast.parentNode) toast.parentNode.removeChild(toast);
+            }, 4000);
+        }
+
+        // Escape HTML to prevent XSS in toast messages
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.appendChild(document.createTextNode(text));
+            return div.innerHTML;
+        }
+
+        // Close sidebar on outside click (mobile)
+        document.addEventListener('click', function(e) {
+            const sidebar = document.getElementById('sidebar');
+            const menuBtn = document.querySelector('.mobile-menu-btn');
+            if (window.innerWidth <= 768 && sidebar.classList.contains('open')) {
+                if (!sidebar.contains(e.target) && e.target !== menuBtn) {
+                    sidebar.classList.remove('open');
+                }
+            }
+        });
+    </script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Login Page Template
+# ---------------------------------------------------------------------------
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spike IAM Admin - Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after {
+            margin: 0; padding: 0; box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0f0f23;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-container {
+            width: 100%;
+            max-width: 400px;
+            padding: 20px;
+        }
+
+        .login-card {
+            background: #1e1e3f;
+            border: 1px solid #2d2d5e;
+            border-radius: 16px;
+            padding: 40px 32px;
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .login-logo {
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #7c3aed, #a78bfa);
+            border-radius: 16px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.6rem;
+            margin-bottom: 16px;
+        }
+
+        .login-header h1 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .login-header p {
+            font-size: 0.9rem;
+            color: #64748b;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #94a3b8;
+            margin-bottom: 8px;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px 16px;
+            background: #16163a;
+            border: 1px solid #2d2d5e;
+            border-radius: 10px;
+            color: #e2e8f0;
+            font-family: inherit;
+            font-size: 0.95rem;
+            transition: all 0.2s ease;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #7c3aed;
+            box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.3);
+        }
+
+        .btn-login {
+            width: 100%;
+            padding: 12px;
+            background: #7c3aed;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-family: inherit;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-top: 8px;
+        }
+
+        .btn-login:hover {
+            background: #6d28d9;
+            box-shadow: 0 0 24px rgba(124, 58, 237, 0.4);
+        }
+
+        .error-msg {
+            background: rgba(239, 68, 68, 0.12);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <div class="login-logo">⚡</div>
+                <h1>Spike IAM Admin</h1>
+                <p>Sign in to manage your onboarding</p>
+            </div>
+
+            {% if error %}
+            <div class="error-msg">{{ error }}</div>
+            {% endif %}
+
+            <form method="POST" action="{{ url_for('login') }}">
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" class="form-control"
+                           placeholder="Enter admin password" autofocus required>
+                </div>
+                <button type="submit" class="btn-login">Sign In</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Dashboard (Overview) Page Template
+# ---------------------------------------------------------------------------
+
+DASHBOARD_TEMPLATE = """
+{% extends base %}
+{% block content %}
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-icon purple">💬</div>
+        <div class="stat-info">
+            <h3>{{ total_sessions }}</h3>
+            <p>Total Interviews</p>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon blue">❓</div>
+        <div class="stat-info">
+            <h3>{{ total_questions }}</h3>
+            <p>Total Questions</p>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon green">🏢</div>
+        <div class="stat-info">
+            <h3>{{ unique_companies }}</h3>
+            <p>Companies</p>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon orange">🎯</div>
+        <div class="stat-info">
+            <h3>{{ system_type_count }}</h3>
+            <p>System Types Used</p>
+        </div>
+    </div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+    <!-- Recent Interviews -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Recent Interviews</h2>
+            <a href="{{ url_for('interviews_page') }}" class="btn btn-secondary btn-sm">View All →</a>
+        </div>
+        {% if recent_sessions %}
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Company</th>
+                        <th>System</th>
+                        <th>Date</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in recent_sessions %}
+                    <tr>
+                        <td style="color:var(--text-primary);font-weight:500;">{{ s.company or 'N/A' }}</td>
+                        <td><span class="badge badge-{{ s.system_type | lower | replace(' ', '-') }}">{{ s.system_type or 'N/A' }}</span></td>
+                        <td>{{ s.created_at.strftime('%b %d, %Y') if s.created_at else 'N/A' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>        </div>
+        {% else %}
+        <div class="empty-state">
+            <div class="empty-icon">💬</div>
+            <h3>No interviews yet</h3>
+            <p>Interviews will appear here once users complete onboarding.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Questions by System Type -->
+    <div class="card">
+        <div class="card-header">
+            <h2>Questions by Type</h2>
+            <a href="{{ url_for('questions_page') }}" class="btn btn-secondary btn-sm">Manage →</a>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px;">
+            {% for st, count in questions_by_type.items() %}
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg-input);border-radius:var(--radius-sm);border:1px solid var(--border);">
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span class="badge badge-{{ st | lower | replace(' ', '-') }}">{{ st }}</span>
+                </div>
+                <span style="font-size:1.1rem;font-weight:600;color:var(--text-primary);">{{ count }}</span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# ---------------------------------------------------------------------------
+# Questions Management Page Template
+# ---------------------------------------------------------------------------
+
+QUESTIONS_TEMPLATE = """
+{% extends base %}
+{% block content %}
+<!-- Add Question Card -->
+<div class="card" style="margin-bottom:24px;">
+    <div class="card-header">
+        <h2>➕ Add New Question</h2>
+    </div>
+    <form id="addQuestionForm" onsubmit="addQuestion(event)" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="form-group" style="flex:3;min-width:200px;margin-bottom:0;">
+            <label for="newQuestion">Question Text</label>
+            <input type="text" id="newQuestion" class="form-control" placeholder="Enter your question..." required>
+        </div>
+        <div class="form-group" style="flex:1;min-width:150px;margin-bottom:0;">
+            <label for="newSystemType">System Type</label>
+            <select id="newSystemType" class="form-control" required>
+                {% for st in system_types %}
+                <option value="{{ st }}">{{ st }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <button type="submit" class="btn btn-primary" style="height:42px;">Add Question</button>
+    </form>
+</div>
+
+<!-- Questions List Card -->
+<div class="card">
+    <div class="card-header">
+        <h2>📋 All Questions</h2>
+        <span style="font-size:0.85rem;color:var(--text-muted);" id="questionCount">{{ total_questions }} total</span>
+    </div>
+
+    <!-- Tabs for system types -->
+    <div class="tabs" id="questionTabs">
+        <button class="tab active" data-type="all" onclick="switchTab('all', this)">All</button>
+        {% for st in system_types %}
+        <button class="tab" data-type="{{ st }}" onclick="switchTab('{{ st }}', this)">{{ st }}</button>
+        {% endfor %}
+    </div>
+
+    <!-- Questions Table -->
+    <div class="table-container">
+        <table id="questionsTable">
+            <thead>
+                <tr>
+                    <th style="width:50px;">ID</th>
+                    <th>Question</th>
+                    <th style="width:140px;">System Type</th>
+                    <th style="width:140px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="questionsBody">
+                <!-- Populated by JS -->
+            </tbody>
+        </table>
+    </div>
+
+    <div class="empty-state" id="emptyState" style="display:none;">
+        <div class="empty-icon">❓</div>
+        <h3>No questions found</h3>
+        <p>Add a question using the form above.</p>
+    </div>
+</div>
+
+<!-- Edit Modal -->
+<div class="modal-overlay" id="editModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>✏️ Edit Question</h3>
+            <button class="modal-close" onclick="closeEditModal()">×</button>
+        </div>
+        <form onsubmit="saveEdit(event)">
+            <input type="hidden" id="editId">
+            <div class="form-group">
+                <label for="editQuestion">Question Text</label>
+                <textarea id="editQuestion" class="form-control" rows="3" required></textarea>
+            </div>
+            <div class="form-group">
+                <label for="editSystemType">System Type</label>
+                <select id="editSystemType" class="form-control" required>
+                    {% for st in system_types %}
+                    <option value="{{ st }}">{{ st }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeEditModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Delete Confirmation Modal -->
+<div class="modal-overlay" id="deleteModal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>⚠️ Confirm Delete</h3>
+            <button class="modal-close" onclick="closeDeleteModal()">×</button>
+        </div>
+        <p style="color:var(--text-secondary);line-height:1.6;">
+            Are you sure you want to delete this question? This action cannot be undone.
+        </p>
+        <p style="margin-top:12px;padding:10px;background:var(--bg-input);border-radius:var(--radius-sm);font-size:0.9rem;color:var(--text-muted);" id="deleteQuestionText"></p>
+        <input type="hidden" id="deleteId">
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
+            <button class="btn btn-danger" onclick="confirmDelete()">Delete Question</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // State
+    let allQuestions = [];
+    let currentFilter = 'all';
+
+    // Load questions on page load
+    document.addEventListener('DOMContentLoaded', loadQuestions);
+
+    // Fetch all questions from API
+    async function loadQuestions() {
+        try {
+            const response = await fetch('/api/questions');
+            if (!response.ok) throw new Error('Failed to load questions');
+            allQuestions = await response.json();
+            renderQuestions();
+        } catch (err) {
+            showToast('Failed to load questions: ' + err.message, 'error');
+        }
+    }
+
+    // Render questions into table based on current filter
+    function renderQuestions() {
+        const tbody = document.getElementById('questionsBody');
+        const emptyState = document.getElementById('emptyState');
+        const countEl = document.getElementById('questionCount');
+
+        const filtered = currentFilter === 'all'
+            ? allQuestions
+            : allQuestions.filter(q => q.system_type === currentFilter);
+
+        countEl.textContent = filtered.length + ' question' + (filtered.length !== 1 ? 's' : '');
+
+        if (filtered.length === 0) {
+            tbody.innerHTML = '';
+            emptyState.style.display = 'block';
+            return;
+        }
+
+        emptyState.style.display = 'none';
+        tbody.innerHTML = filtered.map(q => `
+            <tr data-id="${q.id}" data-type="${q.system_type}">
+                <td style="color:var(--text-muted);font-weight:500;">#${q.id}</td>
+                <td style="color:var(--text-primary);">${escapeHtml(q.question)}</td>                <td><span class="badge badge-${q.system_type.toLowerCase().replace(' ', '-')}">${escapeHtml(q.system_type)}</span></td>
+                <td>
+                    <div style="display:flex;gap:6px;">
+                        <button class="btn btn-secondary btn-sm" onclick="openEditModal(${q.id})" title="Edit">✏️ Edit</button>
+                        <button class="btn btn-danger btn-sm" onclick="openDeleteModal(${q.id})" title="Delete">🗑️</button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    // Tab switching
+    function switchTab(type, el) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        el.classList.add('active');
+        currentFilter = type;
+        renderQuestions();
+    }
+
+    // Add a new question
+    async function addQuestion(e) {
+        e.preventDefault();
+        const question = document.getElementById('newQuestion').value.trim();
+        const systemType = document.getElementById('newSystemType').value;
+
+        if (!question) return;
+
+        try {
+            const response = await fetch('/api/questions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: question, system_type: systemType })
+            });
+
+            if (!response.ok) {
+                const data = await response.json();
+                throw new Error(data.error || 'Failed to add question');
+            }
+
+            document.getElementById('newQuestion').value = '';
+            showToast('Question added successfully!', 'success');
+            await loadQuestions();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+
+    // Open edit modal
+    function openEditModal(id) {
+        const q = allQuestions.find(x => x.id === id);
+        if (!q) return;
+        document.getElementById('editId').value = q.id;
+        document.getElementById('editQuestion').value = q.question;
+        document.getElementById('editSystemType').value = q.system_type;
+        document.getElementById('editModal').classList.add('active');
+    }
+
+    function closeEditModal() {
+        document.getElementById('editModal').classList.remove('active');
+    }
+
+    // Save edited question
+    async function saveEdit(e) {
+        e.preventDefault();
+        const id = document.getElementById('editId').value;
+        const question = document.getElementById('editQuestion').value.trim();
+        const systemType = document.getElementById('editSystemType').value;
+
+        if (!question) return;
+
+        try {
+            const response = await fetch('/api/questions/' + id, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: question, system_type: systemType })
+            });
+
+            if (!response.ok) {
+                const data = await response.json();
+                throw new Error(data.error || 'Failed to update question');
+            }
+
+            closeEditModal();
+            showToast('Question updated successfully!', 'success');
+            await loadQuestions();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+
+    // Open delete confirmation modal
+    function openDeleteModal(id) {
+        const q = allQuestions.find(x => x.id === id);
+        if (!q) return;
+        document.getElementById('deleteId').value = q.id;
+        document.getElementById('deleteQuestionText').textContent = q.question;
+        document.getElementById('deleteModal').classList.add('active');
+    }
+
+    function closeDeleteModal() {
+        document.getElementById('deleteModal').classList.remove('active');
+    }
+
+    // Confirm and execute delete
+    async function confirmDelete() {
+        const id = document.getElementById('deleteId').value;
+
+        try {
+            const response = await fetch('/api/questions/' + id, {
+                method: 'DELETE'
+            });
+
+            if (!response.ok) {
+                const data = await response.json();
+                throw new Error(data.error || 'Failed to delete question');
+            }
+
+            closeDeleteModal();
+            showToast('Question deleted successfully!', 'success');
+            await loadQuestions();
+        } catch (err) {
+            showToast(err.message, 'error');
+        }
+    }
+</script>
+{% endblock %}
+"""
+
+# ---------------------------------------------------------------------------
+# Interviews Page Template
+# ---------------------------------------------------------------------------
+
+INTERVIEWS_TEMPLATE = """
+{% extends base %}
+{% block content %}
+<!-- Filter Bar -->
+<div class="card" style="margin-bottom:24px;">
+    <div class="card-header">
+        <h2>🔍 Filter Interviews</h2>
+        <button class="btn btn-secondary btn-sm" onclick="clearFilters()">Clear Filters</button>
+    </div>
+    <div class="filter-bar">
+        <div class="form-group search-group">
+            <label for="filterCompany">Company</label>
+            <input type="text" id="filterCompany" class="form-control" placeholder="Search by company name..." oninput="debounceFilter()">
+        </div>
+        <div class="form-group">
+            <label for="filterSystemType">System Type</label>
+            <select id="filterSystemType" class="form-control" onchange="applyFilters()">
+                <option value="">All Types</option>
+                {% for st in system_types %}
+                <option value="{{ st }}">{{ st }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="filterDateFrom">From Date</label>
+            <input type="date" id="filterDateFrom" class="form-control" onchange="applyFilters()">
+        </div>
+        <div class="form-group">
+            <label for="filterDateTo">To Date</label>
+            <input type="date" id="filterDateTo" class="form-control" onchange="applyFilters()">
+        </div>
+    </div>
+</div>
+
+<!-- Sessions Table Card -->
+<div class="card">
+    <div class="card-header">
+        <h2>💬 Interview Sessions</h2>
+        <span style="font-size:0.85rem;color:var(--text-muted);" id="sessionCount">Loading...</span>
+    </div>
+
+    <div class="table-container">
+        <table id="sessionsTable">
+            <thead>
+                <tr>
+                    <th style="width:50px;">ID</th>
+                    <th>Company</th>
+                    <th>Target System</th>
+                    <th>System Type</th>
+                    <th>Date</th>
+                    <th style="width:60px;"></th>
+                </tr>
+            </thead>
+            <tbody id="sessionsBody">
+                <!-- Populated by JS -->
+            </tbody>
+        </table>
+    </div>
+
+    <div class="empty-state" id="sessionsEmpty" style="display:none;">
+        <div class="empty-icon">💬</div>
+        <h3>No interviews found</h3>
+        <p>Try adjusting your filters or wait for users to complete onboarding.</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // State
+    let allSessions = [];
+    let expandedSession = null;
+    let filterDebounceTimer = null;
+
+    // Load sessions on page load
+    document.addEventListener('DOMContentLoaded', applyFilters);
+
+    // Debounce for company search input
+    function debounceFilter() {
+        clearTimeout(filterDebounceTimer);
+        filterDebounceTimer = setTimeout(applyFilters, 300);
+    }
+
+    // Fetch sessions with current filter values
+    async function applyFilters() {
+        const company = document.getElementById('filterCompany').value.trim();
+        const systemType = document.getElementById('filterSystemType').value;
+        const dateFrom = document.getElementById('filterDateFrom').value;
+        const dateTo = document.getElementById('filterDateTo').value;
+
+        // Build query string
+        const params = new URLSearchParams();
+        if (company) params.append('company', company);
+        if (systemType) params.append('system_type', systemType);
+        if (dateFrom) params.append('date_from', dateFrom);
+        if (dateTo) params.append('date_to', dateTo);
+
+        try {
+            const response = await fetch('/api/sessions?' + params.toString());
+            if (!response.ok) throw new Error('Failed to load sessions');
+            allSessions = await response.json();
+            expandedSession = null;
+            renderSessions();
+        } catch (err) {
+            showToast('Failed to load sessions: ' + err.message, 'error');
+        }
+    }
+
+    // Clear all filter inputs and reload
+    function clearFilters() {
+        document.getElementById('filterCompany').value = '';
+        document.getElementById('filterSystemType').value = '';
+        document.getElementById('filterDateFrom').value = '';
+        document.getElementById('filterDateTo').value = '';
+        applyFilters();
+    }
+
+    // Render sessions into the table
+    function renderSessions() {
+        const tbody = document.getElementById('sessionsBody');
+        const emptyState = document.getElementById('sessionsEmpty');
+        const countEl = document.getElementById('sessionCount');
+
+        countEl.textContent = allSessions.length + ' session' + (allSessions.length !== 1 ? 's' : '');
+
+        if (allSessions.length === 0) {
+            tbody.innerHTML = '';
+            emptyState.style.display = 'block';
+            return;
+        }
+
+        emptyState.style.display = 'none';
+
+        let html = '';
+        allSessions.forEach(s => {
+            const isExpanded = expandedSession === s.id;
+            const dateStr = s.created_at ? new Date(s.created_at).toLocaleDateString('en-US', {
+                year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            }) : 'N/A';
+
+            const badgeClass = s.system_type ? s.system_type.toLowerCase().replace(' ', '-') : 'generic';
+
+            // Main row
+            html += `
+            <tr class="clickable-row" onclick="toggleDetail(${s.id})" style="${isExpanded ? 'background:rgba(124,58,237,0.1);' : ''}">
+                <td style="color:var(--text-muted);font-weight:500;">#${s.id}</td>
+                <td style="color:var(--text-primary);font-weight:500;">${escapeHtml(s.company || 'N/A')}</td>
+                <td>${escapeHtml(s.target_system || 'N/A')}</td>
+                <td><span class="badge badge-${badgeClass}">${escapeHtml(s.system_type || 'N/A')}</span></td>
+                <td>${dateStr}</td>
+                <td style="font-size:1.1rem;text-align:center;">${isExpanded ? '▼' : '▶'}</td>
+            </tr>`;
+
+            // Detail row (expanded)
+            if (isExpanded) {
+                html += renderDetail(s);
+            }
+        });
+
+        tbody.innerHTML = html;
+    }
+
+    // Render the expanded interview detail for a session
+    function renderDetail(s) {
+        const original = s.collected_data_original || {};
+        const english = s.collected_data_english || {};
+
+        // Collect all unique question keys from both sets
+        const allKeys = new Set([...Object.keys(original), ...Object.keys(english)]);
+
+        let originalPairs = '';
+        let englishPairs = '';
+
+        allKeys.forEach(key => {
+            const oVal = original[key];
+            const eVal = english[key];
+
+            if (oVal !== undefined && oVal !== null) {
+                originalPairs += `
+                <div class="qa-pair">
+                    <div class="qa-question">${escapeHtml(String(key))}</div>
+                    <div class="qa-answer">${escapeHtml(String(oVal))}</div>
+                </div>`;
+            }
+
+            if (eVal !== undefined && eVal !== null) {
+                englishPairs += `
+                <div class="qa-pair">
+                    <div class="qa-question">${escapeHtml(String(key))}</div>
+                    <div class="qa-answer">${escapeHtml(String(eVal))}</div>
+                </div>`;
+            }
+        });
+
+        if (!originalPairs && !englishPairs) {
+            originalPairs = '<p style="color:var(--text-muted);font-size:0.9rem;">No data collected.</p>';
+            englishPairs = '<p style="color:var(--text-muted);font-size:0.9rem;">No data collected.</p>';
+        }
+
+        const dateStr = s.created_at ? new Date(s.created_at).toLocaleString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit'
+        }) : 'N/A';
+
+        return `
+        <tr class="interview-detail active">
+            <td colspan="6" style="padding:0;">
+                <div class="detail-content">
+                    <div class="detail-meta">
+                        <div class="detail-meta-item">
+                            <span>🏢</span> <strong>Company:</strong> ${escapeHtml(s.company || 'N/A')}
+                        </div>
+                        <div class="detail-meta-item">
+                            <span>🎯</span> <strong>Target:</strong> ${escapeHtml(s.target_system || 'N/A')}
+                        </div>
+                        <div class="detail-meta-item">
+                            <span>⚙️</span> <strong>Type:</strong> ${escapeHtml(s.system_type || 'N/A')}
+                        </div>
+                        <div class="detail-meta-item">
+                            <span>📅</span> <strong>Date:</strong> ${dateStr}
+                        </div>
+                    </div>
+                    <div class="qa-grid">
+                        <div class="qa-column">
+                            <h4>📝 Original Responses</h4>
+                            ${originalPairs}
+                        </div>
+                        <div class="qa-column">
+                            <h4>🌐 English Translation</h4>
+                            ${englishPairs}
+                        </div>
+                    </div>
+                </div>
+            </td>
+        </tr>`;
+    }
+
+    // Toggle expanded detail for a session row
+    function toggleDetail(id) {
+        if (expandedSession === id) {
+            expandedSession = null;
+        } else {
+            expandedSession = id;
+        }
+        renderSessions();
+    }
+</script>
+{% endblock %}
+"""
+
+# ---------------------------------------------------------------------------
+# Helper: render a page using the base template
+# ---------------------------------------------------------------------------
+
+def render_page(content_template, **kwargs):
+    """
+    Renders a page by combining the BASE_TEMPLATE with a content template.
+    The content template uses {% extends base %} and {% block content %}.
+    We achieve this by using Jinja2's render_template_string with the
+    base template injected as a variable.
+    """
+    # Since Jinja2 render_template_string doesn't support string-based extends
+    # natively, we build the full page by inserting content into the base.
+    # We'll use a simpler approach: replace the {% block content %} placeholder.
+
+    # Actually, render_template_string DOES support extends if we use
+    # the template loader, but we're going string-only. So let's manually
+    # compose the final template.
+
+    # Strategy: The content_template defines blocks. We'll manually inject
+    # the content and scripts into the base template.
+
+    from jinja2 import Environment, BaseLoader
+
+    env = Environment(loader=BaseLoader())
+
+    # Parse the content template to extract block content and block scripts
+    import re
+
+    content_match = re.search(
+        r'\{%\s*block\s+content\s*%\}(.*?)\{%\s*endblock\s*%\}',
+        content_template,
+        re.DOTALL
+    )
+    scripts_match = re.search(
+        r'\{%\s*block\s+scripts\s*%\}(.*?)\{%\s*endblock\s*%\}',
+        content_template,
+        re.DOTALL
+    )
+
+    content_block = content_match.group(1) if content_match else ''
+    scripts_block = scripts_match.group(1) if scripts_match else ''
+
+    # Insert blocks into the base template
+    full_template = BASE_TEMPLATE.replace(
+        '{% block content %}{% endblock %}', content_block
+    )
+    full_template = full_template.replace(
+        '{% block scripts %}{% endblock %}', scripts_block
+    )
+
+    return render_template_string(full_template, **kwargs)
+
+
+# ===========================================================================
+# ROUTES – Authentication
+# ===========================================================================
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login page with password authentication."""
+    error = None
+    if request.method == 'POST':
+        password = request.form.get('password', '')
+        if password == ADMIN_PASSWORD:
+            session['authenticated'] = True
+            return redirect(url_for('dashboard'))
+        else:
+            error = 'Invalid password. Please try again.'
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+
+@app.route('/logout')
+def logout():
+    """Log the user out and redirect to login."""
+    session.clear()
+    return redirect(url_for('login'))
+
+
+# ===========================================================================
+# ROUTES – Dashboard Pages
+# ===========================================================================
+
+@app.route('/')
+@login_required
+def dashboard():
+    """Main dashboard overview page with stats."""
+    with get_db() as db:
+        total_sessions = db.query(OnboardingSession).count()
+        total_questions = db.query(Question).count()
+
+        # Count unique companies
+        companies = db.query(OnboardingSession.company).distinct().all()
+        unique_companies = len([c for c in companies if c[0]])
+
+        # Count distinct system types used in sessions
+        system_types_used = db.query(OnboardingSession.system_type).distinct().all()
+        system_type_count = len([s for s in system_types_used if s[0]])
+
+        # Recent sessions (last 5)
+        recent_sessions = (
+            db.query(OnboardingSession)
+            .order_by(OnboardingSession.created_at.desc())
+            .limit(5)
+            .all()
+        )
+
+        # Questions grouped by system type
+        questions_by_type = {}
+        for st in SYSTEM_TYPES:
+            count = db.query(Question).filter(Question.system_type == st).count()
+            questions_by_type[st] = count
+
+    return render_page(
+        DASHBOARD_TEMPLATE,
+        page_title='Dashboard',
+        active_page='dashboard',
+        total_sessions=total_sessions,
+        total_questions=total_questions,
+        unique_companies=unique_companies,
+        system_type_count=system_type_count,
+        recent_sessions=recent_sessions,
+        questions_by_type=questions_by_type,
+    )
+
+
+@app.route('/questions')
+@login_required
+def questions_page():
+    """Questions management page."""
+    with get_db() as db:
+        total_questions = db.query(Question).count()
+
+    return render_page(
+        QUESTIONS_TEMPLATE,
+        page_title='Question Management',
+        active_page='questions',
+        system_types=SYSTEM_TYPES,
+        total_questions=total_questions,
+    )
+
+
+@app.route('/interviews')
+@login_required
+def interviews_page():
+    """Interview viewer page."""
+    return render_page(
+        INTERVIEWS_TEMPLATE,
+        page_title='Interview Viewer',
+        active_page='interviews',
+        system_types=SYSTEM_TYPES,
+    )
+
+
+# ===========================================================================
+# API ROUTES – Questions CRUD
+# ===========================================================================
+
+@app.route('/api/questions', methods=['GET'])
+@login_required
+def api_get_questions():
+    """
+    GET /api/questions
+    Returns all questions as JSON. Optionally filter by system_type query param.
+    """
+    try:
+        with get_db() as db:
+            system_type = request.args.get('system_type')
+            query = db.query(Question)
+
+            if system_type:
+                query = query.filter(Question.system_type == system_type)
+
+            questions = query.order_by(Question.id.asc()).all()
+
+            result = [
+                {
+                    'id': q.id,
+                    'question': q.question,
+                    'system_type': q.system_type,
+                }
+                for q in questions
+            ]
+            return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/questions', methods=['POST'])
+@login_required
+def api_create_question():
+    """
+    POST /api/questions
+    Create a new question. Expects JSON body with 'question' and 'system_type'.
+    """
+    try:
+        with get_db() as db:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body must be JSON'}), 400
+
+            question_text = data.get('question', '').strip()
+            system_type = data.get('system_type', '').strip()
+
+            if not question_text:
+                return jsonify({'error': 'Question text is required'}), 400
+
+            if system_type not in SYSTEM_TYPES:
+                return jsonify({'error': f'Invalid system type. Must be one of: {", ".join(SYSTEM_TYPES)}'}), 400
+
+            new_question = Question(question=question_text, system_type=system_type)
+            db.add(new_question)
+            db.commit()
+            db.refresh(new_question)
+
+            return jsonify({
+                'id': new_question.id,
+                'question': new_question.question,
+                'system_type': new_question.system_type,
+            }), 201
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/questions/<int:question_id>', methods=['GET'])
+@login_required
+def api_get_question(question_id):
+    """
+    GET /api/questions/<id>
+    Retrieve a single question by ID.
+    """
+    try:
+        with get_db() as db:
+            question = db.query(Question).filter(Question.id == question_id).first()
+            if not question:
+                return jsonify({'error': 'Question not found'}), 404
+
+            return jsonify({
+                'id': question.id,
+                'question': question.question,
+                'system_type': question.system_type,
+            }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/questions/<int:question_id>', methods=['PUT'])
+@login_required
+def api_update_question(question_id):
+    """
+    PUT /api/questions/<id>
+    Update an existing question. Expects JSON body with 'question' and/or 'system_type'.
+    """
+    try:
+        with get_db() as db:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Request body must be JSON'}), 400
+
+            question = db.query(Question).filter(Question.id == question_id).first()
+            if not question:
+                return jsonify({'error': 'Question not found'}), 404
+
+            # Update fields if provided
+            if 'question' in data:
+                new_text = data['question'].strip()
+                if not new_text:
+                    return jsonify({'error': 'Question text cannot be empty'}), 400
+                question.question = new_text
+
+            if 'system_type' in data:
+                new_type = data['system_type'].strip()
+                if new_type not in SYSTEM_TYPES:
+                    return jsonify({'error': f'Invalid system type. Must be one of: {", ".join(SYSTEM_TYPES)}'}), 400
+                question.system_type = new_type
+
+            db.commit()
+            db.refresh(question)
+
+            return jsonify({
+                'id': question.id,
+                'question': question.question,
+                'system_type': question.system_type,
+            }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/questions/<int:question_id>', methods=['DELETE'])
+@login_required
+def api_delete_question(question_id):
+    """
+    DELETE /api/questions/<id>
+    Delete a question by ID.
+    """
+    try:
+        with get_db() as db:
+            question = db.query(Question).filter(Question.id == question_id).first()
+            if not question:
+                return jsonify({'error': 'Question not found'}), 404
+
+            db.delete(question)
+            db.commit()
+
+            return jsonify({'message': 'Question deleted successfully'}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ===========================================================================
+# API ROUTES – Sessions (Interviews)
+# ===========================================================================
+
+@app.route('/api/sessions', methods=['GET'])
+@login_required
+def api_get_sessions():
+    """
+    GET /api/sessions
+    Returns all onboarding sessions as JSON.
+    Supports query params for filtering:
+      - company: partial match (case-insensitive)
+      - system_type: exact match
+      - date_from: sessions on or after this date (YYYY-MM-DD)
+      - date_to: sessions on or before this date (YYYY-MM-DD)
+    """
+    try:
+        with get_db() as db:
+            query = db.query(OnboardingSession)
+
+            # Filter by company name (partial, case-insensitive)
+            company = request.args.get('company', '').strip()
+            if company:
+                query = query.filter(
+                    OnboardingSession.company.ilike(f'%{company}%')
+                )
+
+            # Filter by system_type (exact match)
+            system_type = request.args.get('system_type', '').strip()
+            if system_type:
+                query = query.filter(OnboardingSession.system_type == system_type)
+
+            # Filter by date range
+            date_from = request.args.get('date_from', '').strip()
+            if date_from:
+                try:
+                    from_dt = datetime.strptime(date_from, '%Y-%m-%d')
+                    query = query.filter(OnboardingSession.created_at >= from_dt)
+                except ValueError:
+                    pass  # Ignore invalid date format
+
+            date_to = request.args.get('date_to', '').strip()
+            if date_to:
+                try:
+                    # Include the entire end date by setting time to end of day
+                    to_dt = datetime.strptime(date_to, '%Y-%m-%d').replace(
+                        hour=23, minute=59, second=59
+                    )
+                    query = query.filter(OnboardingSession.created_at <= to_dt)
+                except ValueError:
+                    pass  # Ignore invalid date format
+
+            # Order by newest first
+            sessions = query.order_by(OnboardingSession.created_at.desc()).all()
+
+            result = []
+            for s in sessions:
+                # Safely serialize JSON data
+                original = s.collected_data_original
+                english = s.collected_data_english
+
+                # Handle cases where data might be stored as a string
+                if isinstance(original, str):
+                    try:
+                        original = json.loads(original)
+                    except (json.JSONDecodeError, TypeError):
+                        original = {}
+                if isinstance(english, str):
+                    try:
+                        english = json.loads(english)
+                    except (json.JSONDecodeError, TypeError):
+                        english = {}
+
+                result.append({
+                    'id': s.id,
+                    'company': s.company,
+                    'target_system': s.target_system,
+                    'system_type': s.system_type,
+                    'collected_data_original': original or {},
+                    'collected_data_english': english or {},
+                    'created_at': s.created_at.isoformat() if s.created_at else None,
+                })
+
+            return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<int:session_id>', methods=['GET'])
+@login_required
+def api_get_session(session_id):
+    """
+    GET /api/sessions/<id>
+    Retrieve a single session by ID with full detail.
+    """
+    try:
+        with get_db() as db:
+            s = db.query(OnboardingSession).filter(
+                OnboardingSession.id == session_id
+            ).first()
+
+            if not s:
+                return jsonify({'error': 'Session not found'}), 404
+
+            original = s.collected_data_original
+            english = s.collected_data_english
+
+            if isinstance(original, str):
+                try:
+                    original = json.loads(original)
+                except (json.JSONDecodeError, TypeError):
+                    original = {}
+            if isinstance(english, str):
+                try:
+                    english = json.loads(english)
+                except (json.JSONDecodeError, TypeError):
+                    english = {}
+
+            return jsonify({
+                'id': s.id,
+                'company': s.company,
+                'target_system': s.target_system,
+                'system_type': s.system_type,
+                'collected_data_original': original or {},
+                'collected_data_english': english or {},
+                'created_at': s.created_at.isoformat() if s.created_at else None,
+            }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ===========================================================================
+# Error Handlers
+# ===========================================================================
+
+@app.errorhandler(404)
+def not_found(e):
+    """Handle 404 errors."""
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Resource not found'}), 404
+    return redirect(url_for('dashboard'))
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    """Handle 500 errors."""
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Internal server error'}), 500
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Error</title></head>
+    <body style="background:#0f0f23;color:#e2e8f0;font-family:Inter,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;">
+        <div style="text-align:center;">
+            <h1 style="font-size:3rem;margin-bottom:16px;">500</h1>
+            <p style="color:#94a3b8;">Something went wrong. Please try again.</p>
+            <a href="/" style="color:#7c3aed;margin-top:16px;display:inline-block;">← Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """), 500
+
+
+# ===========================================================================
+# Entry Point
+# ===========================================================================
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  Spike IAM Admin Dashboard")
+    print("  Running on http://localhost:5001")
+    print("  Password: (set via ADMIN_PASSWORD env var)")
+    print("=" * 60)    
+    app.run(host='0.0.0.0', port=5001, debug=True)
