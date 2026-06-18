@@ -69,23 +69,24 @@ DB_NAME=iam_onboarding_db
 ### 5. Installa e Avvia il DB
 
 #### a. Installa Docker Desktop ([https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)).
-#### b. Avvia PostgreSQL e Adminer tramite Docker Compose
+#### b. Aprire Docker
+#### c. Avvia PostgreSQL e Adminer tramite Docker Compose
 *(Assicurati di aver creato il file `docker-compose.yml` nella root del progetto)*
 
 ```bash
 docker-compose up -d
 ```
 
-#### c. Verifica che i container siano in esecuzione
+#### d. Verifica che i container siano in esecuzione
 Puoi controllare da Docker Desktop oppure aprendo il browser su `http://localhost:8080` (Adminer) per esplorare visivamente il database usando le credenziali inserite nel file `.env`.
 
-#### d. Crea le tabelle del DB
+#### e. Crea le tabelle del DB
 
 ```bash
 python create_tables.py
 ```
 
-#### d. Riempi con i primi record le tabelle del DB
+#### f. Riempi con i primi record le tabelle del DB
 
 ```bash
 python seed.py
