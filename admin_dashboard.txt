@@ -590,7 +590,7 @@ BASE_TEMPLATE = """
             color: #ec4899;
         }
 
-        .badge-sap {
+        .badge-ldap {
             background: rgba(43, 25, 102, 0.15);
             color: #1ab6ef;
         }
