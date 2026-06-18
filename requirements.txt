@@ -5,3 +5,7 @@ python-dotenv
 openpyxl
 sqlalchemy
 psycopg2-binary
+flask
+flask_sqlalchemy
+python-docx
+bcrypt

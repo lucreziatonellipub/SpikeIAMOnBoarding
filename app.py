@@ -6,7 +6,7 @@ import urllib3
 import os
 from dotenv import load_dotenv
 from database import get_db
-from models import Question
+from models import Question, OnboardingSession
 from database import engine, SessionLocal
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -585,6 +585,7 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                 )
                 db.add(nuova_sessione)
                 db.commit()
+                
                 print(f"✅ Dati salvati con successo per la company: {company_name}")
                 
         except Exception as e:
