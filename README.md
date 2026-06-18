@@ -103,6 +103,14 @@ chainlit run app.py -w
 
 ---
 
+### 6. Avvia l'admin dashboard
+
+```bash
+python run_dashboard.py
+```
+---
+
+
 ## 🗺️ Roadmap e Prossime Integrazioni (To-Do)
 
 Il progetto è attualmente in fase Alpha. I prossimi step di sviluppo previsti sono:
