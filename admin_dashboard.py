@@ -25,7 +25,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Configuration
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "spike2025")
 SECRET_KEY = os.getenv("SECRET_KEY", "spike-admin-secret-key-change-in-prod")
-SYSTEM_TYPES = ["Generic", "AD-Azure", "Target DB", "SAP"]
+SYSTEM_TYPES = ["Generic", "AD-Azure", "Target DB", "SAP", "LDAP"]
 
 # Azure OpenAI Configuration
 AZURE_LLM_URL = os.getenv("AZURE_LLM_URL", "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview")
@@ -222,6 +222,7 @@ If no authoritative source is mentioned, write [TO BE DEFINED].
 ### Connector and Connection Configuration
 Based on system type and interview data:
 - For AD-Azure: AD / Azure AD connector details, domains, domain controllers if known, Azure AD Connect schedule, synchronization scope, relevant network/firewall constraints.
+- For LDAP: LDAP connector details, domains, synchronization scope, relevant network/firewall constraints.
 - For Target DB: Generic Database Connector details, database technology, server/database/schema/table names if available, service account, expected privileges, read/write mode.
 - For SAP: SAP connector details if available.
 - For Generic: connector type must be derived from interview answers; otherwise [TO BE DEFINED].
@@ -448,6 +449,7 @@ BASE_TEMPLATE = '''
         .badge-ad-azure { background: #1e3a2a; color: #34d399; }
         .badge-target-db { background: #3b2a1e; color: #fbbf24; }
         .badge-sap { background: #2a1e3b; color: #a78bfa; }
+        .badge-ldap {background: rgba(43, 25, 102, 0.15); color: #1ab6ef;}
         .badge-active { background: #064e3b; color: #6ee7b7; }
         .badge-completed { background: #1e3a5f; color: #60a5fa; }
         .badge-abandoned { background: #3b1e1e; color: #fca5a5; }
@@ -810,6 +812,7 @@ QUESTIONS_TEMPLATE = '''
                     <option value="AD-Azure">AD-Azure</option>
                     <option value="Target DB">Target DB</option>
                     <option value="SAP">SAP</option>
+                    <option value="LDAP">LDAP</option>
                 </select>
             </div>
             <div style="display:flex;gap:12px;justify-content:flex-end;margin-top:24px;">
@@ -1425,6 +1428,23 @@ def _build_llm_prompt(session_obj):
         system_mapping = """
 SYSTEM-SPECIFIC MAPPING FOR AD-Azure:
 Use interview answers about AD domains, OU hierarchy, employee/external OUs, disabled-account OUs, group OUs, group descriptions, standard/default groups, Office 365 license assignment, Azure AD Connect schedule, synchronization scope, network/firewall constraints, sample employee/external accounts, SAMAccountName and UPN conventions, account creation/modification/disabling, OU movement rules, exceptions, and custom scenarios.
+
+Map them mainly to:
+- Current State
+- Project Environments
+- Integration with Target Systems
+- Connector and Connection Configuration
+- Account Definition and Identity Linking
+- Attribute Mapping Logic
+- Access Rights / Entitlements
+- Synchronization and Provisioning
+- RBAC Model
+- Joiner, Mover and Leaver Processes
+"""
+    if system_type == "ldap":
+        system_mapping = """
+SYSTEM-SPECIFIC MAPPING FOR LDAP:
+Use interview answers about LDAP domains, DN hierarchy, employee/external DNs, disabled-account DNs, group DNs, group descriptions, standard/default groups, synchronization scope, network/firewall constraints, sample employee/external accounts, DN and names conventions, account creation/modification/disabling, DN movement rules, exceptions, and custom scenarios.
 
 Map them mainly to:
 - Current State

@@ -48,7 +48,7 @@ from models import OnboardingSession, Question, Base
 # ---------------------------------------------------------------------------
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "spike2025")
 SECRET_KEY = os.getenv("SECRET_KEY", "spike-admin-secret-key-change-in-prod")
-SYSTEM_TYPES = ["Generic", "AD-Azure", "Target DB", "SAP"]
+SYSTEM_TYPES = ["Generic", "AD-Azure", "Target DB", "SAP", "LDAP"]
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -588,6 +588,11 @@ BASE_TEMPLATE = """
         .badge-sap {
             background: rgba(236, 72, 153, 0.15);
             color: #ec4899;
+        }
+
+        .badge-sap {
+            background: rgba(43, 25, 102, 0.15);
+            color: #1ab6ef;
         }
 
         /* ============================================================

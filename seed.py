@@ -7,7 +7,6 @@ Base.metadata.create_all(bind=engine)
 db = SessionLocal()
 
 # Inserimento record iniziali
-# TODO: da fare
 db.add_all([
     Question(question="How many target systems are in scope, and what are their names?", system_type="Generic"),
     Question(question="For each target system, what is its priority and business/operational criticality level?", system_type="Generic"),
@@ -116,7 +115,40 @@ db.add_all([
     Question(question="What is the current process to request new access rights in SAP (e.g., via ServiceNow), and how is it managed end‑to‑end?", system_type="SAP"),
     Question(question="Are there any customizations or particular/critical scenarios in SAP that we should consider for the IGA integration?", system_type="SAP"),
     Question(question="Is a Segregation of Duties (SoD) framework already in place for SAP , and how is it implemented (tools, rules, processes)?", system_type="SAP"),
-    Question(question="Will the technical connection be established via the SAP message server, and what are the relevant connection details?", system_type="SAP")
+    Question(question="Will the technical connection be established via the SAP message server, and what are the relevant connection details?", system_type="SAP"),
+    Question(question="How many LDAP directory instances are in scope, and what are their base DNs (Distinguished Names)?" , system_type="LDAP"),
+    Question(question="Which environments are available for the LDAP directory (e.g., PROD only, or also DEV/TEST/UAT)?" , system_type="LDAP"),
+    Question(question="Where is the LDAP directory located in the network, and which firewall rules or network constraints are relevant for the IGA integration (e.g., ports 389/LDAP, 636/LDAPS)?" , system_type="LDAP"),
+    Question(question="Which LDAP protocol version is supported (LDAPv2, LDAPv3), and is TLS/SSL (LDAPS or StartTLS) enforced?" , system_type="LDAP"),
+    Question(question="What type of LDAP directory software is deployed (e.g., OpenLDAP, Oracle Internet Directory, 389 DS, IBM Tivoli Directory), and what version?" , system_type="LDAP"),
+    Question(question="Is there a replication topology in place (e.g., multi-master, provider-consumer), and which node should the IGA platform connect to for read/write operations?" , system_type="LDAP"),
+    Question(question="Which bind DN (service account) will be used by the IGA platform, and what permissions does it have (read, write, create, delete)?" , system_type="LDAP"),
+    Question(question="Are there connection limits, rate-limiting policies, or size/time limits configured on the LDAP server that may impact bulk operations?" , system_type="LDAP"),
+    Question(question="Are referrals enabled, and should the IGA connector follow them?" , system_type="LDAP"),
+    Question(question=" What is the current DIT (Directory Information Tree) structure, and how is it organized (e.g., by country, organization, function)?" , system_type="LDAP"),
+    Question(question=" Are there dedicated subtrees (OUs or container entries) for employees and separate ones for external users?" , system_type="LDAP"),
+    Question(question=" Are there dedicated subtrees for different countries or geographic regions?" , system_type="LDAP"),
+    Question(question=" Is there a dedicated subtree for groups/roles, and how is it structured?" , system_type="LDAP"),
+    Question(question=" Is there a dedicated subtree for disabled/deprovisioned accounts, and how is it used?" , system_type="LDAP"),
+    Question(question=" Under which conditions are user entries moved between subtrees, and how is this process managed?" , system_type="LDAP"),
+    Question(question=" Which rules are currently applied to determine in which subtree a new entry must be created?" , system_type="LDAP"),
+    Question(question=" Which objectClasses are used for user entries (e.g., inetOrgPerson, posixAccount, custom objectClasses)?" , system_type="LDAP"),
+    Question(question=" What is the current naming convention for the RDN (Relative Distinguished Name) of user entries (e.g., uid=, cn=)?" , system_type="LDAP"),
+    Question(question=" Which attributes are mandatory and which are optional for user provisioning?" , system_type="LDAP"),
+    Question(question=" Which attribute uniquely identifies a user (e.g., uid, employeeNumber, entryUUID)?" , system_type="LDAP"),
+    Question(question=" Can we perform a deep dive on a sample employee entry to review all relevant attributes and their values?" , system_type="LDAP"),
+    Question(question=" Can we perform a deep dive on a sample external user entry to review all relevant attributes and their values?" , system_type="LDAP"),
+    Question(question=" Which rules govern the provisioning of individual attributes (both standard and custom/extended attributes)?" , system_type="LDAP"),
+    Question(question=" How is the user lifecycle managed at the attribute level (e.g., nsAccountLock, pwdAccountLockedTime, operational attributes for disabling)?" , system_type="LDAP"),
+    Question(question=" What is the current process for account creation, modification, and disabling/deletion in the LDAP directory?" , system_type="LDAP"),
+    Question(question=" Is account disabling handled via a specific attribute (e.g., nsAccountLock: true, pwdAccountLockedTime), entry removal, or relocation to a disabled subtree?" , system_type="LDAP"),
+    Question(question=" How are user entries managed with respect to organizational attributes (e.g., o, ou, departmentNumber) for subtree placement or group membership?" , system_type="LDAP"),
+    Question(question=" Which objectClass is used for groups (e.g., groupOfNames, groupOfUniqueNames, posixGroup, groupOfURLs for dynamic groups)?" , system_type="LDAP"),
+    Question(question=" What is the approximate number of groups defined, and are meaningful descriptions (e.g., description attribute) available?" , system_type="LDAP"),
+    Question(question=" How many managed applications are in scope, and is there an attribute available to identify the application associated with each group or entitlement?" , system_type="LDAP"),
+    Question(question=" Are there standard groups that must be automatically assigned to specific user classes (e.g., by organization, country, role)?" , system_type="LDAP"),
+    Question(question=" Which groups must be assigned by default based on specific rules (e.g., country, organization, role, contract type)?" , system_type="LDAP"),
+    Question(question=" Are dynamic groups (e.g., memberURL-based) in use, and how should the IGA platform handle them?" , system_type="LDAP")
 ])
 
 db.commit()

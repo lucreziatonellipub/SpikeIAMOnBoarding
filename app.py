@@ -210,7 +210,8 @@ async def main(message: cl.Message):
             cl.Action(name="choose_type", payload={"value": "Generic"}, label="Generic"),
             cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
             cl.Action(name="choose_type", payload={"value": "Target DB"}, label="Target DB"),
-            cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP")
+            cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
+            cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP")
         ]
         
         await cl.Message(
