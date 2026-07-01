@@ -207,9 +207,8 @@ async def main(message: cl.Message):
         cl.user_session.set("step", "system_type")
         
         actions = [
-            cl.Action(name="choose_type", payload={"value": "Generic"}, label="Generic"),
+            cl.Action(name="choose_other_target_system_type", payload={"value": "Others"}, label="Others"),
             cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
-            cl.Action(name="choose_type", payload={"value": "Target DB"}, label="Target DB"),
             cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
             cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP")
         ]
@@ -227,8 +226,6 @@ async def main(message: cl.Message):
         await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
 
     # --- STEP 3A: Gestione dell'Upload Excel ---
-
-
     elif step == "upload_excel":
         if not message.elements:
             await cl.Message(content="⚠️ Please upload the completed Excel file using the attachment button (📎).").send()
@@ -499,6 +496,39 @@ async def on_choose_type(action: cl.Action):
         actions=actions,
     ).send()
 
+@cl.action_callback("choose_other_target_system_type")
+async def on_choose_other_target_system_type(action: cl.Action):
+
+    # TODO: mettere la chiamata all'agente per la qualità della domanda
+    questions_number = 7
+
+    while i < questions_number:
+        async with cl.Step(name="Contextual Question Selection"):
+            system_prompt_ask = f"""You are a Senior Technical Consultant conducting a formal IAM integration assessment. Your aim is to understand what is the target system type in order to integrate it in
+            the IGA system. You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it. Keep in mind that the user doesn't know
+            what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
+
+
+
+                            
+                                
+            INSTRUCTIONS:
+            1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about (e.g., APIs, permissions tables on DB, data model).
+            2. Understand what's the better next question to ask. Think about the one question that logically and semantically follows the PREVIOUS CONTEXT to keep a fluid conversation. 
+            4. Make the question in a highly professional, polite, and formal B2B tone.
+            5. Be precise and clear. Do NOT use informal greetings.
+
+            Reply ONLY and EXCLUSIVELY with the question you want to pone.
+            }}"""
+
+        # Chiamata all'LLM di Azure per selezionare la prossima domanda
+        response_str = call_azure_llm(user_message="", system_prompt=system_prompt_ask)
+
+        # Invia la domanda all'utente
+        await cl.Message(content=f"💬 {response_str}").send()
+
+        i += 1
+
 # ==========================================
 # CALLBACK: Method Selection (Chat vs Excel)
 # ==========================================
@@ -652,3 +682,4 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
     
     # Invia la domanda all'utente
     await cl.Message(content=f"💬 {conversational_question}").send()
+

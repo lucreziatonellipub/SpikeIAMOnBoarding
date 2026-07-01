@@ -96,7 +96,6 @@ python seed.py
 
 ```bash
 chainlit run app.py -w
-
 ```
 
 *(Il flag `-w` o `--watch` ricarica automaticamente l'app se modifichi il codice).*
