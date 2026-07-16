@@ -207,7 +207,7 @@ async def main(message: cl.Message):
         cl.user_session.set("step", "system_type")
         
         actions = [
-            cl.Action(name="choose_other_target_system_type", payload={"value": "Others"}, label="Others"),
+            cl.Action(name="choose_type", payload={"value": "Others"}, label="Others"),
             cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
             cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
             cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP")
@@ -217,7 +217,7 @@ async def main(message: cl.Message):
             content=f"✅ Target System: **{message.content}**.\n\nWhat **type** of target system is it? Choose an option below to load the specific questions.",
             actions=actions
         ).send()
-
+        
     # --- EXTRA CHECK: User types instead of clicking the button ---
     elif step == "system_type":
         await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send() 
@@ -426,6 +426,9 @@ Note: "extracted_data" must be populated ONLY if status is "success"."""
 async def on_choose_type(action: cl.Action):
 
     system_type = action.payload.get("value")
+    if system_type == "Others":
+        system_type = await on_choose_other_target_system_type()
+
     cl.user_session.set("system_type", system_type)
 
     questions = load_questions_from_DB(system_type)
@@ -496,38 +499,78 @@ async def on_choose_type(action: cl.Action):
         actions=actions,
     ).send()
 
-@cl.action_callback("choose_other_target_system_type")
-async def on_choose_other_target_system_type(action: cl.Action):
+async def on_choose_other_target_system_type() -> str:
+    max_questions = 7
+    conversation_history = []
 
-    # TODO: mettere la chiamata all'agente per la qualità della domanda
-    questions_number = 7
+    system_prompt_ask = """You are a Senior Technical Consultant conducting a formal IAM integration assessment.
+Your aim is to understand what is the target system type in order to integrate it in the IGA system.
+You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it.
+Keep in mind that the user doesn't know what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
 
-    while i < questions_number:
-        async with cl.Step(name="Contextual Question Selection"):
-            system_prompt_ask = f"""You are a Senior Technical Consultant conducting a formal IAM integration assessment. Your aim is to understand what is the target system type in order to integrate it in
-            the IGA system. You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it. Keep in mind that the user doesn't know
-            what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
+INSTRUCTIONS:
+1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about.
+2. Ask the ONE question that logically follows the previous context to keep a fluid conversation.
+3. Use a highly professional, polite, and formal B2B tone.
+4. Be precise and clear. Do NOT use informal greetings.
 
+Reply ONLY and EXCLUSIVELY with the question you want to ask."""
 
+    system_prompt_evaluate = """You are an expert system architect. Based on the conversation below, determine if the target system is a "Target DB".
 
-                            
-                                
-            INSTRUCTIONS:
-            1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about (e.g., APIs, permissions tables on DB, data model).
-            2. Understand what's the better next question to ask. Think about the one question that logically and semantically follows the PREVIOUS CONTEXT to keep a fluid conversation. 
-            4. Make the question in a highly professional, polite, and formal B2B tone.
-            5. Be precise and clear. Do NOT use informal greetings.
+Classification:
+- "Target DB": the system's user/account data is managed via direct database access (SQL, stored procedures, DB tables).
+- "Generic": ANY other case, or if you are not yet sure.
 
-            Reply ONLY and EXCLUSIVELY with the question you want to pone.
-            }}"""
+If you can confidently determine it is a database-based system: reply ONLY with "Target DB".
+Otherwise: reply ONLY with "Generic"."""
 
-        # Chiamata all'LLM di Azure per selezionare la prossima domanda
-        response_str = call_azure_llm(user_message="", system_prompt=system_prompt_ask)
+    async with cl.Step(name="Identifying Target System Type"):
+        for i in range(max_questions):
+            # Genera la prossima domanda basata sul contesto
+            context = "\n".join(conversation_history) if conversation_history else "No previous context yet."
+            user_msg_for_llm = f"PREVIOUS CONTEXT:\n{context}\n\nAsk the next question."
 
-        # Invia la domanda all'utente
-        await cl.Message(content=f"💬 {response_str}").send()
+            question = call_azure_llm(
+                user_message=user_msg_for_llm,
+                system_prompt=system_prompt_ask
+            )
 
-        i += 1
+            # Invia la domanda e attendi la risposta dell'utente
+            res = await cl.AskUserMessage(content=f"💬 {question}", timeout=300).send()
+
+            if res is None:
+                await cl.Message(content="⏱️ Timeout reached. Defaulting to 'Custom connector'.").send()
+                return "Custom connector"
+
+            user_answer = res["output"]
+            conversation_history.append(f"Q: {question}")
+            conversation_history.append(f"A: {user_answer}")
+
+            # Valuta se abbiamo abbastanza informazioni
+            eval_context = "\n".join(conversation_history)
+            evaluation = call_azure_llm(
+                user_message=f"CONVERSATION:\n{eval_context}",
+                system_prompt=system_prompt_evaluate
+            )
+
+            if evaluation.strip().upper() != "UNKNOWN":
+                await cl.Message(
+                    content=f"✅ Target system type identified: **{evaluation.strip()}**"
+                ).send()
+                return evaluation.strip()
+
+        # Raggiunto il massimo di domande senza identificazione certa
+        await cl.Message(
+            content="⚠️ Maximum questions reached. Please specify the target system type manually."
+        ).send()
+        final_res = await cl.AskUserMessage(
+            content="Please provide the target system type:", timeout=300
+        ).send()
+
+        print(final_res["output"])
+
+        return final_res["output"] if final_res else "Unknown"
 
 # ==========================================
 # CALLBACK: Method Selection (Chat vs Excel)
