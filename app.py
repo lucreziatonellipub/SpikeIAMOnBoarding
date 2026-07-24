@@ -499,8 +499,14 @@ async def on_choose_type(action: cl.Action):
         actions=actions,
     ).send()
 
+# Corrected async function: fixes early-stop bug by requiring a minimum
+# number of Q&A exchanges and a "CONFIDENT" flag before stopping early.
+# The evaluation LLM now returns "label|confidence" internally, but only
+# "Target DB" or "Generic" are ever shown to the user or returned.
+
 async def on_choose_other_target_system_type() -> str:
     max_questions = 7
+    min_questions = 3  # Minimum number of Q&A exchanges before early-stop is allowed
     conversation_history = []
 
     system_prompt_ask = """You are a Senior Technical Consultant conducting a formal IAM integration assessment.
@@ -516,18 +522,26 @@ INSTRUCTIONS:
 
 Reply ONLY and EXCLUSIVELY with the question you want to ask."""
 
-    system_prompt_evaluate = """You are an expert system architect. Based on the conversation below, determine if the target system is a "Target DB".
+    system_prompt_evaluate = """You are an expert system architect performing a rigorous technical classification.
+Carefully analyze the ENTIRE conversation below before deciding — do not rely only on the last message.
+Determine whether the target system integration is a "Target DB" or "Generic".
 
-Classification:
-- "Target DB": the system's user/account data is managed via direct database access (SQL, stored procedures, DB tables).
-- "Generic": ANY other case, or if you are not yet sure.
+Classification rules (apply equal rigor to both labels — never treat one as a default fallback):
+- "Target DB": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the system's user/account data is managed via direct database access (e.g. explicit mention of SQL, stored procedures, direct read/write on DB tables).
+- "Generic": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the integration method is something OTHER than direct database access (e.g. explicit mention of APIs, web services, connectors, flat files, or any other non-DB method).
 
-If you can confidently determine it is a database-based system: reply ONLY with "Target DB".
-Otherwise: reply ONLY with "Generic"."""
+You must ALWAYS provide your best-guess label, even if the evidence is vague or incomplete — never refuse to guess.
+Additionally, provide a confidence flag:
+- Reply "CONFIDENT" ONLY if there is explicit, unambiguous evidence in the conversation clearly supporting your chosen label.
+- Otherwise, reply "NOT_CONFIDENT" while still providing your best-guess label (do not default to "Generic" for convenience — justify it with the same rigor as "Target DB").
+
+Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character, in this exact format:
+"Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
 
     async with cl.Step(name="Identifying Target System Type"):
+        last_label = None  # Keeps track of the last evaluated label for best-effort fallback
+
         for i in range(max_questions):
-            # Genera la prossima domanda basata sul contesto
             context = "\n".join(conversation_history) if conversation_history else "No previous context yet."
             user_msg_for_llm = f"PREVIOUS CONTEXT:\n{context}\n\nAsk the next question."
 
@@ -536,7 +550,6 @@ Otherwise: reply ONLY with "Generic"."""
                 system_prompt=system_prompt_ask
             )
 
-            # Invia la domanda e attendi la risposta dell'utente
             res = await cl.AskUserMessage(content=f"💬 {question}", timeout=300).send()
 
             if res is None:
@@ -547,30 +560,42 @@ Otherwise: reply ONLY with "Generic"."""
             conversation_history.append(f"Q: {question}")
             conversation_history.append(f"A: {user_answer}")
 
-            # Valuta se abbiamo abbastanza informazioni
             eval_context = "\n".join(conversation_history)
             evaluation = call_azure_llm(
                 user_message=f"CONVERSATION:\n{eval_context}",
                 system_prompt=system_prompt_evaluate
             )
 
-            if evaluation.strip().upper() != "UNKNOWN":
+            # Parse the "label|confidence" response from the evaluation LLM.
+            raw_evaluation = evaluation.strip()
+            if "|" in raw_evaluation:
+                label_part, confidence_part = raw_evaluation.split("|", 1)
+                label = label_part.strip()
+                confidence = confidence_part.strip().upper()
+            else:
+                # Defensive fallback in case the LLM doesn't respect the format.
+                label = raw_evaluation.strip()
+                confidence = "NOT_CONFIDENT"
+
+            last_label = label  # Keep the most recent label for best-effort fallback at the end
+
+            # Only consider stopping early once at least min_questions exchanges
+            # have happened AND the evaluation is CONFIDENT.
+            enough_exchanges = (i + 1) >= min_questions
+            if enough_exchanges and confidence == "CONFIDENT":
                 await cl.Message(
-                    content=f"✅ Target system type identified: **{evaluation.strip()}**"
+                    content=f"✅ Target system type identified: **{label}**"
                 ).send()
-                return evaluation.strip()
+                return label
 
-        # Raggiunto il massimo di domande senza identificazione certa
+        # Max questions reached without a CONFIDENT evaluation:
+        # take the last evaluation's label as the best-effort final answer.
+        best_effort_label = last_label if last_label else "Generic"
         await cl.Message(
-            content="⚠️ Maximum questions reached. Please specify the target system type manually."
-        ).send()
-        final_res = await cl.AskUserMessage(
-            content="Please provide the target system type:", timeout=300
+            content=f"⚠️ Maximum questions reached. Best-effort target system type: **{best_effort_label}**"
         ).send()
 
-        print(final_res["output"])
-
-        return final_res["output"] if final_res else "Unknown"
+        return best_effort_label
 
 # ==========================================
 # CALLBACK: Method Selection (Chat vs Excel)
