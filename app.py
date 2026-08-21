@@ -424,80 +424,74 @@ Note: "extracted_data" must be populated ONLY if status is "success"."""
 # ==========================================
 @cl.action_callback("choose_type")
 async def on_choose_type(action: cl.Action):
+    try:
+        system_type = action.payload.get("value")
+        if system_type == "Others":
+            system_type = await on_choose_other_target_system_type()
 
-    system_type = action.payload.get("value")
-    if system_type == "Others":
-        system_type = await on_choose_other_target_system_type()
+        cl.user_session.set("system_type", system_type)
 
-    cl.user_session.set("system_type", system_type)
+        questions = await cl.make_async(load_questions_from_DB)(system_type)
+        cl.user_session.set("questions", questions)
+        cl.user_session.set("step", "choose_method")
 
-    questions = load_questions_from_DB(system_type)
-    cl.user_session.set("questions", questions)
+        actions = [
+            cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
+            cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+        ]
 
-    cl.user_session.set("step", "choose_method")
+        file_path = "Obiettivi AI - Target Systems.xlsx"
+        df = pd.DataFrame({"Question": questions, "Answer": [""] * len(questions)})
 
-    actions = [
-        cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
-        cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
-    ]
+        def build_excel():
+            from openpyxl import load_workbook  # <-- import spostato qui dentro
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
 
-    # --- Excel generation with styling ---
-    file_path = "Obiettivi AI - Target Systems.xlsx"
+            df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
 
-    df = pd.DataFrame({
-        "Question": questions,
-        "Answer": [""] * len(questions),
-    })
+            wb = load_workbook(file_path)
+            ws = wb.active
 
-    df.to_excel(file_path, index=False, sheet_name=system_type, engine="openpyxl")
+            header_font = Font(bold=True, color="FFFFFF", size=11)
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell_alignment = Alignment(vertical="top", wrap_text=True)
+            thin_border = Border(
+                left=Side(style="thin"), right=Side(style="thin"),
+                top=Side(style="thin"), bottom=Side(style="thin"),
+            )
+            alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
 
-    from openpyxl import load_workbook
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = thin_border
 
-    wb = load_workbook(file_path)
-    ws = wb.active
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
+                for cell in row:
+                    cell.alignment = cell_alignment
+                    cell.border = thin_border
+                    if row_idx % 2 == 0:
+                        cell.fill = alt_fill
 
-    # Stili
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell_alignment = Alignment(vertical="top", wrap_text=True)
-    thin_border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
-    )
-    alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
+            ws.column_dimensions[get_column_letter(1)].width = 60
+            ws.column_dimensions[get_column_letter(2)].width = 40
+            ws.freeze_panes = "A2"
 
-    # Header
-    for col_idx, cell in enumerate(ws[1], start=1):
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-        cell.border = thin_border
+            wb.save(file_path)
 
-    # Righe dati: bordi, alignment, colore alternato
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
-        for cell in row:
-            cell.alignment = cell_alignment
-            cell.border = thin_border
-            if row_idx % 2 == 0:
-                cell.fill = alt_fill
+        await cl.make_async(build_excel)()
 
-    # Larghezza colonne
-    ws.column_dimensions[get_column_letter(1)].width = 60  # Question
-    ws.column_dimensions[get_column_letter(2)].width = 40  # Answer
+        await cl.Message(
+            content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
+            actions=actions,
+        ).send()
 
-    # Freeze del header
-    ws.freeze_panes = "A2"
-
-    wb.save(file_path)
-    # --- Fine styling ---
-
-    await cl.Message(
-        content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
-        actions=actions,
-    ).send()
+    except Exception as e:
+        await cl.Message(content=f"❌ Errore durante la selezione del target system: `{e}`").send()
+        raise
 
 # Corrected async function: fixes early-stop bug by requiring a minimum
 # number of Q&A exchanges and a "CONFIDENT" flag before stopping early.
