@@ -18,6 +18,41 @@ from functools import partial
 from auth import verify_password, load_users
 
 load_dotenv()
+
+# ==========================================
+# CONSTANTS: Prompts for "Others" identification flow
+# ==========================================
+
+OTHER_SYSTEM_PROMPT_ASK = """You are a Senior Technical Consultant conducting a formal IAM integration assessment.
+Your aim is to understand what is the target system type in order to integrate it in the IGA system.
+You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it.
+Keep in mind that the user doesn't know what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
+
+INSTRUCTIONS:
+1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about.
+2. Ask the ONE question that logically follows the previous context to keep a fluid conversation.
+3. Use a highly professional, polite, and formal B2B tone.
+4. Be precise and clear. Do NOT use informal greetings.
+
+Reply ONLY and EXCLUSIVELY with the question you want to ask."""
+
+OTHER_SYSTEM_PROMPT_EVALUATE = """You are an expert system architect performing a rigorous technical classification.
+Carefully analyze the ENTIRE conversation below before deciding — do not rely only on the last message.
+Determine whether the target system integration is a "Target DB" or "Generic".
+
+Classification rules (apply equal rigor to both labels — never treat one as a default fallback):
+- "Target DB": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the system's user/account data is managed via direct database access (e.g. explicit mention of SQL, stored procedures, direct read/write on DB tables).
+- "Generic": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the integration method is something OTHER than direct database access (e.g. explicit mention of APIs, web services, connectors, flat files, or any other non-DB method).
+
+You must ALWAYS provide your best-guess label, even if the evidence is vague or incomplete — never refuse to guess.
+Additionally, provide a confidence flag:
+- Reply "CONFIDENT" ONLY if there is explicit, unambiguous evidence in the conversation clearly supporting your chosen label.
+- Otherwise, reply "NOT_CONFIDENT" while still providing your best-guess label.
+
+Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character:
+"Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
+
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
@@ -222,6 +257,109 @@ async def main(message: cl.Message):
     elif step == "system_type":
         await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send() 
 # --- EXTRA CHECK: User types instead of clicking the button (per la scelta del metodo) ---
+    elif step == "other_identification":
+        max_questions = 7
+        min_questions = 3
+
+        conversation = cl.user_session.get("other_conversation")
+        exchange_count = cl.user_session.get("other_exchange_count")
+
+        # Salva la risposta dell'utente
+        conversation.append(f"A: {message.content}")
+        exchange_count += 1
+        cl.user_session.set("other_conversation", conversation)
+        cl.user_session.set("other_exchange_count", exchange_count)
+
+        # Valuta se abbiamo abbastanza info
+        eval_context = "\n".join(conversation)
+        evaluation = await cl.make_async(call_azure_llm)(
+            user_message=f"CONVERSATION:\n{eval_context}",
+            system_prompt=OTHER_SYSTEM_PROMPT_EVALUATE
+        )
+
+        raw_evaluation = evaluation.strip()
+        if "|" in raw_evaluation:
+            label, confidence = raw_evaluation.split("|", 1)
+            label = label.strip()
+            confidence = confidence.strip().upper()
+        else:
+            label = raw_evaluation.strip()
+            confidence = "NOT_CONFIDENT"
+
+        enough_exchanges = exchange_count >= min_questions
+        identified = enough_exchanges and confidence == "CONFIDENT"
+        max_reached = exchange_count >= max_questions
+
+        if identified or max_reached:
+            # Identificazione completata → prosegui con il flusso normale
+            system_type = label if label in ("Target DB", "Generic") else "Generic"
+
+            if identified:
+                await cl.Message(content=f"✅ Target system type identified: **{system_type}**").send()
+            else:
+                await cl.Message(content=f"⚠️ Maximum questions reached. Best-effort type: **{system_type}**").send()
+
+            cl.user_session.set("system_type", system_type)
+            questions = await cl.make_async(load_questions_from_DB)(system_type)
+            cl.user_session.set("questions", questions)
+            cl.user_session.set("step", "choose_method")
+
+            file_path = "Obiettivi AI - Target Systems.xlsx"
+            df = pd.DataFrame({"Question": questions, "Answer": [""] * len(questions)})
+
+            def build_excel():
+                from openpyxl import load_workbook
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                from openpyxl.utils import get_column_letter
+
+                df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
+                wb = load_workbook(file_path)
+                ws = wb.active
+                header_font = Font(bold=True, color="FFFFFF", size=11)
+                header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell_alignment = Alignment(vertical="top", wrap_text=True)
+                thin_border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                                     top=Side(style="thin"), bottom=Side(style="thin"))
+                alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_alignment
+                    cell.border = thin_border
+                for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
+                    for cell in row:
+                        cell.alignment = cell_alignment
+                        cell.border = thin_border
+                        if row_idx % 2 == 0:
+                            cell.fill = alt_fill
+                ws.column_dimensions[get_column_letter(1)].width = 60
+                ws.column_dimensions[get_column_letter(2)].width = 40
+                ws.freeze_panes = "A2"
+                wb.save(file_path)
+
+            await cl.make_async(build_excel)()
+
+            actions = [
+                cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
+                cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+            ]
+            await cl.Message(
+                content=f"How would you like to provide the technical requirements?",
+                actions=actions,
+            ).send()
+
+        else:
+            # Fai la prossima domanda
+            context = "\n".join(conversation)
+            next_question = await cl.make_async(call_azure_llm)(
+                user_message=f"PREVIOUS CONTEXT:\n{context}\n\nAsk the next question.",
+                system_prompt=OTHER_SYSTEM_PROMPT_ASK
+            )
+            conversation.append(f"Q: {next_question}")
+            cl.user_session.set("other_conversation", conversation)
+            await cl.Message(content=f"💬 {next_question}").send()
+    
     elif step == "choose_method":
         await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
 
@@ -426,64 +564,67 @@ Note: "extracted_data" must be populated ONLY if status is "success"."""
 async def on_choose_type(action: cl.Action):
     try:
         system_type = action.payload.get("value")
+
         if system_type == "Others":
-            system_type = await on_choose_other_target_system_type()
+            # Inizializza lo stato per il flusso "Others"
+            cl.user_session.set("step", "other_identification")
+            cl.user_session.set("other_conversation", [])
+            cl.user_session.set("other_exchange_count", 0)
 
+            # Genera la prima domanda e inviala come messaggio normale
+            first_question = call_azure_llm(
+                user_message="PREVIOUS CONTEXT:\nNo previous context yet.\n\nAsk the next question.",
+                system_prompt=OTHER_SYSTEM_PROMPT_ASK
+            )
+            await cl.Message(content=f"💬 {first_question}").send()
+            return  # <-- IL CALLBACK TERMINA QUI
+
+        # Per tutti gli altri tipi (AD-Azure, SAP, LDAP) il flusso rimane invariato
         cl.user_session.set("system_type", system_type)
-
         questions = await cl.make_async(load_questions_from_DB)(system_type)
         cl.user_session.set("questions", questions)
         cl.user_session.set("step", "choose_method")
-
-        actions = [
-            cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
-            cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
-        ]
 
         file_path = "Obiettivi AI - Target Systems.xlsx"
         df = pd.DataFrame({"Question": questions, "Answer": [""] * len(questions)})
 
         def build_excel():
-            from openpyxl import load_workbook  # <-- import spostato qui dentro
+            from openpyxl import load_workbook
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
 
             df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
-
             wb = load_workbook(file_path)
             ws = wb.active
-
             header_font = Font(bold=True, color="FFFFFF", size=11)
             header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
             header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell_alignment = Alignment(vertical="top", wrap_text=True)
-            thin_border = Border(
-                left=Side(style="thin"), right=Side(style="thin"),
-                top=Side(style="thin"), bottom=Side(style="thin"),
-            )
+            thin_border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                                 top=Side(style="thin"), bottom=Side(style="thin"))
             alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
-
             for cell in ws[1]:
                 cell.font = header_font
                 cell.fill = header_fill
                 cell.alignment = header_alignment
                 cell.border = thin_border
-
             for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
                 for cell in row:
                     cell.alignment = cell_alignment
                     cell.border = thin_border
                     if row_idx % 2 == 0:
                         cell.fill = alt_fill
-
             ws.column_dimensions[get_column_letter(1)].width = 60
             ws.column_dimensions[get_column_letter(2)].width = 40
             ws.freeze_panes = "A2"
-
             wb.save(file_path)
 
         await cl.make_async(build_excel)()
 
+        actions = [
+            cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
+            cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+        ]
         await cl.Message(
             content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
             actions=actions,
@@ -492,6 +633,22 @@ async def on_choose_type(action: cl.Action):
     except Exception as e:
         await cl.Message(content=f"❌ Errore durante la selezione del target system: `{e}`").send()
         raise
+
+async def _send_method_choice(system_type: str):
+    """Invia i bottoni choose_method in un contesto pulito, fuori dal callback."""
+    await asyncio.sleep(0.5)
+
+    cl.user_session.set("step", "choose_method")
+
+    actions = [
+        cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
+        cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+    ]
+
+    await cl.Message(
+        content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
+        actions=actions,
+    ).send()
 
 # Corrected async function: fixes early-stop bug by requiring a minimum
 # number of Q&A exchanges and a "CONFIDENT" flag before stopping early.
