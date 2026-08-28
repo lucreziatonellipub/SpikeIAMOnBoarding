@@ -11,90 +11,66 @@ from database import engine, SessionLocal
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-
 import asyncio
 from functools import partial
-					
+
 from auth import verify_password, load_users
 
 load_dotenv()
 
-# ==========================================
-# CONSTANTS: Prompts for "Others" identification flow
-# ==========================================
-
-OTHER_SYSTEM_PROMPT_ASK = """You are a Senior Technical Consultant conducting a formal IAM integration assessment.
-Your aim is to understand what is the target system type in order to integrate it in the IGA system.
-You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it.
-Keep in mind that the user doesn't know what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
-
-INSTRUCTIONS:
-1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about.
-2. Ask the ONE question that logically follows the previous context to keep a fluid conversation.
-3. Use a highly professional, polite, and formal B2B tone.
-4. Be precise and clear. Do NOT use informal greetings.
-
-Reply ONLY and EXCLUSIVELY with the question you want to ask."""
-
-OTHER_SYSTEM_PROMPT_EVALUATE = """You are an expert system architect performing a rigorous technical classification.
-Carefully analyze the ENTIRE conversation below before deciding — do not rely only on the last message.
-Determine whether the target system integration is a "Target DB" or "Generic".
-
-Classification rules (apply equal rigor to both labels — never treat one as a default fallback):
-- "Target DB": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the system's user/account data is managed via direct database access (e.g. explicit mention of SQL, stored procedures, direct read/write on DB tables).
-- "Generic": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the integration method is something OTHER than direct database access (e.g. explicit mention of APIs, web services, connectors, flat files, or any other non-DB method).
-
-You must ALWAYS provide your best-guess label, even if the evidence is vague or incomplete — never refuse to guess.
-Additionally, provide a confidence flag:
-- Reply "CONFIDENT" ONLY if there is explicit, unambiguous evidence in the conversation clearly supporting your chosen label.
-- Otherwise, reply "NOT_CONFIDENT" while still providing your best-guess label.
-
-Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character:
-"Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
-
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ==========================================
+# SECTION 0: Localization helpers
+# ==========================================
+
+LANG_IT = "it"
+LANG_EN = "en"
+
+def get_lang() -> str:
+    """Return stable language code from session, default to EN."""
+    lang = cl.user_session.get("lang_code")
+    return lang if lang in (LANG_IT, LANG_EN) else LANG_EN
+
+def t(it: str, en: str, *, lang: str | None = None) -> str:
+    """Pick localized text based on selected language."""
+    code = lang or get_lang()
+    return it if code == LANG_IT else en
+
+def set_language(lang_code: str):
+    """Persist both stable code and readable label."""
+    code = LANG_IT if lang_code == LANG_IT else LANG_EN
+    cl.user_session.set("lang_code", code)
+    cl.user_session.set("lang_name", "Italiano" if code == LANG_IT else "English")
+
+def require_buttons_warning_language_step() -> str:
+    # Before choice, we must be bilingual or "appropriate"; bilingual is safest.
+    return "⚠️ Per favore seleziona la lingua usando i pulsanti qui sopra.\n⚠️ Please select the language using the buttons above."
+
+def step_name(key: str) -> str:
+    """Localized cl.Step visible names (best effort)."""
+    names = {
+        "language": ( "Selezione lingua", "Language selection"),
+        "company": ( "Inserimento azienda", "Company input"),
+        "intent_analysis": ( "Analisi intento e dati", "Intent and Data Analysis"),
+        "identifying_target": ( "Identificazione tipo Target System", "Identifying Target System Type"),
+        "validation_excel": ( "Validazione risposte Excel", "Excel answers validation"),
+        "translate_save": ( "Elaborazione e traduzione dati", "Data processing & translation"),
+        "question_selection": ( "Selezione domanda contestuale", "Contextual Question Selection"),
+    }
+    it, en = names.get(key, (key, key))
+    return t(it, en)
+
+def user_lang_instruction() -> str:
+    """Instruction to force assistant visible output to chosen language."""
+    return t(
+        "ISTRUZIONE VINCOLANTE: rispondi ESCLUSIVAMENTE in Italiano, indipendentemente dalla lingua digitata dall'utente.",
+        "BINDING INSTRUCTION: respond EXCLUSIVELY in English, regardless of the language typed by the user."
+    )
 
 # ==========================================
 # SECTION 1: Azure OpenAI Configuration
 # ==========================================
-"""
-def call_azure_llm(user_message: str, system_prompt: str = "") -> str:
-    azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
-    api_key = os.getenv("AZURE_API_KEY") 
-    
-    if not api_key:
-        return '{"status": "error", "message": "Error: Missing AZURE_API_KEY"}'
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        "model": "gpt-5.4-mini"
-    }
-    
-    try:
-        response = requests.post(azure_url, headers=headers, json=payload, verify=False)
-        response.raise_for_status()
-        
-        response_data = response.json()
-        
-        # 👇 ECCO LA RIGA CORRETTA CON LA NUOVA STRUTTURA DEL JSON 👇
-        return response_data["output"][0]["content"][0]["text"]
-        
-    except Exception as e:
-        error_details = str(e)
-        if 'response' in locals() and response.text:
-            error_details += f" | Response: {response.text}"
-        return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
-"""
-
 
 def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool = False) -> str:
     azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
@@ -131,25 +107,23 @@ def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool =
         return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
 
 
-
 # ==========================================
 # SECTION 2: Dynamic Excel Reading
 # ==========================================
 def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name)
-        # Assuming the column is still named 'Domanda' in your Excel. 
-        # Change to 'Question' if you translate the Excel header too.
+        # Keep technical column name 'Question' unchanged
         return df['Question'].dropna().tolist()
     except Exception as e:
         print(f"Error reading the Excel file: {e}")
-        # Fallback questions in case of error
         return [
             "Is the target system exposed to the internet or only available on the intranet?",
             "What authentication protocol does it use?",
             "Is there a test environment separated from the production one?"
         ]
-    
+
+
 # ==========================================
 # SECTION 3: Dynamic DB Reading
 # ==========================================
@@ -168,7 +142,6 @@ def load_questions_from_DB(system_type: str) -> list:
         return questions
     except Exception as e:
         print(f"Error connecting/reading DB: {e}")
-        # Fallback questions in case of error
         return [
             "Is the target system exposed to the internet or only available on the intranet?",
             "What authentication protocol does it use?",
@@ -176,11 +149,9 @@ def load_questions_from_DB(system_type: str) -> list:
         ]
 
 
-
-
-
-
-
+# ==========================================
+# SECTION 4: Auth
+# ==========================================
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):
     users = load_users()
@@ -207,74 +178,134 @@ def auth_callback(username: str, password: str):
     )
 
 
+# ==========================================
+# CONSTANTS: Prompts for "Others" identification flow (localized at runtime)
+# ==========================================
+def other_system_prompt_ask() -> str:
+    return f"""{user_lang_instruction()}
+You are a Senior Technical Consultant conducting a formal IAM integration assessment.
+Your aim is to understand what is the target system type in order to integrate it in the IGA system.
+You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it.
+Keep in mind that the user doesn't know what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
+
+INSTRUCTIONS:
+1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about.
+2. Ask the ONE question that logically follows the previous context to keep a fluid conversation.
+3. Use a highly professional, polite, and formal B2B tone.
+4. Be precise and clear. Do NOT use informal greetings.
+
+Reply ONLY and EXCLUSIVELY with the question you want to ask."""
+
+def other_system_prompt_evaluate() -> str:
+    # This is internal/technical; no user-visible output required. Keep in English for determinism.
+    return """You are an expert system architect performing a rigorous technical classification.
+Carefully analyze the ENTIRE conversation below before deciding — do not rely only on the last message.
+Determine whether the target system integration is a "Target DB" or "Generic".
+
+Classification rules (apply equal rigor to both labels — never treat one as a default fallback):
+- "Target DB": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the system's user/account data is managed via direct database access (e.g. explicit mention of SQL, stored procedures, direct read/write on DB tables).
+- "Generic": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the integration method is something OTHER than direct database access (e.g. explicit mention of APIs, web services, connectors, flat files, or any other non-DB method).
+
+You must ALWAYS provide your best-guess label, even if the evidence is vague or incomplete — never refuse to guess.
+Additionally, provide a confidence flag:
+- Reply "CONFIDENT" ONLY if there is explicit, unambiguous evidence in the conversation clearly supporting your chosen label.
+- Otherwise, reply "NOT_CONFIDENT" while still providing your best-guess label.
+
+Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character:
+"Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
 
 
 # ==========================================
-# SECTION 4: Initial Flow Management
+# SECTION 5: Initial Flow Management (Language -> Company -> System -> Type -> Method)
 # ==========================================
 @cl.on_chat_start
 async def start():
-    # Setup session state
     cl.user_session.set("answers", {})
-    cl.user_session.set("step", "company")
-    
+    cl.user_session.set("step", "language")
+    cl.user_session.set("lang_code", None)
+    cl.user_session.set("lang_name", None)
+
+    actions = [
+        cl.Action(name="choose_language", payload={"value": LANG_IT}, label="Italiano"),
+        cl.Action(name="choose_language", payload={"value": LANG_EN}, label="English"),
+    ]
+
     await cl.Message(
-        content="### 👋 Welcome to Spike IAM Onboarding\n\nTo configure your environment, please enter the **Company Name**:"
+        content="### Spike IAM Onboarding\n\nSeleziona la lingua / Select your language:",
+        actions=actions
     ).send()
+
 
 @cl.on_message
 async def main(message: cl.Message):
-
     step = cl.user_session.get("step")
-    answers = cl.user_session.get("answers")
-    
+    answers = cl.user_session.get("answers") or {}
+
+    # --- STEP 0: Language ---
+    if step == "language":
+        await cl.Message(content=require_buttons_warning_language_step()).send()
+        return
+
     # --- STEP 1: Company ---
     if step == "company":
         cl.user_session.set("company", message.content)
         cl.user_session.set("step", "system")
         await cl.Message(
-            content=f"🏢 **Company:** {message.content}\n\nGreat. What is the **Name of the Target System** we are integrating?"
+            content=t(
+                f"🏢 **Company:** {message.content}\n\nPerfetto. Qual è il **nome del Target System** che stiamo integrando?",
+                f"🏢 **Company:** {message.content}\n\nGreat. What is the **Name of the Target System** we are integrating?"
+            )
         ).send()
-        
-    # --- STEP 2: System ---
-    elif step == "system":
+        return
+
+    # --- STEP 2: System name ---
+    if step == "system":
         cl.user_session.set("system", message.content)
         cl.user_session.set("step", "system_type")
-        
+
         actions = [
-            cl.Action(name="choose_type", payload={"value": "Others"}, label="Others"),
+            cl.Action(name="choose_type", payload={"value": "Others"}, label=t("Others", "Others")),
             cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
             cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
-            cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP")
+            cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP"),
         ]
-        
+
         await cl.Message(
-            content=f"✅ Target System: **{message.content}**.\n\nWhat **type** of target system is it? Choose an option below to load the specific questions.",
+            content=t(
+                f"✅ Target System: **{message.content}**.\n\nChe **tipo** di target system è? Scegli un'opzione qui sotto per caricare le domande specifiche.",
+                f"✅ Target System: **{message.content}**.\n\nWhat **type** of target system is it? Choose an option below to load the specific questions."
+            ),
             actions=actions
         ).send()
-        
-    # --- EXTRA CHECK: User types instead of clicking the button ---
-    elif step == "system_type":
-        await cl.Message(content="⚠️ **Please use the buttons above** to select the system type.").send() 
-# --- EXTRA CHECK: User types instead of clicking the button (per la scelta del metodo) ---
-    elif step == "other_identification":
+        return
+
+    # --- EXTRA CHECK: User types instead of clicking the button (system type selection) ---
+    if step == "system_type":
+        await cl.Message(
+            content=t(
+                "⚠️ **Usa i pulsanti sopra** per selezionare il tipo di sistema.",
+                "⚠️ **Please use the buttons above** to select the system type."
+            )
+        ).send()
+        return
+
+    # --- Others identification flow (user typing is expected here) ---
+    if step == "other_identification":
         max_questions = 7
         min_questions = 3
 
-        conversation = cl.user_session.get("other_conversation")
-        exchange_count = cl.user_session.get("other_exchange_count")
+        conversation = cl.user_session.get("other_conversation") or []
+        exchange_count = cl.user_session.get("other_exchange_count") or 0
 
-        # Salva la risposta dell'utente
         conversation.append(f"A: {message.content}")
         exchange_count += 1
         cl.user_session.set("other_conversation", conversation)
         cl.user_session.set("other_exchange_count", exchange_count)
 
-        # Valuta se abbiamo abbastanza info
         eval_context = "\n".join(conversation)
         evaluation = await cl.make_async(call_azure_llm)(
             user_message=f"CONVERSATION:\n{eval_context}",
-            system_prompt=OTHER_SYSTEM_PROMPT_EVALUATE
+            system_prompt=other_system_prompt_evaluate()
         )
 
         raw_evaluation = evaluation.strip()
@@ -291,13 +322,22 @@ async def main(message: cl.Message):
         max_reached = exchange_count >= max_questions
 
         if identified or max_reached:
-            # Identificazione completata → prosegui con il flusso normale
             system_type = label if label in ("Target DB", "Generic") else "Generic"
 
             if identified:
-                await cl.Message(content=f"✅ Target system type identified: **{system_type}**").send()
+                await cl.Message(
+                    content=t(
+                        f"✅ Tipo di target system identificato: **{system_type}**",
+                        f"✅ Target system type identified: **{system_type}**"
+                    )
+                ).send()
             else:
-                await cl.Message(content=f"⚠️ Maximum questions reached. Best-effort type: **{system_type}**").send()
+                await cl.Message(
+                    content=t(
+                        f"⚠️ Raggiunto il numero massimo di domande. Tipo stimato: **{system_type}**",
+                        f"⚠️ Maximum questions reached. Best-effort type: **{system_type}**"
+                    )
+                ).send()
 
             cl.user_session.set("system_type", system_type)
             questions = await cl.make_async(load_questions_from_DB)(system_type)
@@ -309,8 +349,6 @@ async def main(message: cl.Message):
 
             def build_excel():
                 from openpyxl import load_workbook
-                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-                from openpyxl.utils import get_column_letter
 
                 df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
                 wb = load_workbook(file_path)
@@ -341,32 +379,45 @@ async def main(message: cl.Message):
             await cl.make_async(build_excel)()
 
             actions = [
-                cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
-                cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+                cl.Action(name="choose_method", payload={"value": "chat"}, label=t("💬 Continua in chat", "💬 Continue in Chat")),
+                cl.Action(name="choose_method", payload={"value": "excel"}, label=t("📊 Scarica & Carica Excel", "📊 Download & Upload Excel")),
             ]
             await cl.Message(
-                content=f"How would you like to provide the technical requirements?",
+                content=t(
+                    "Come preferisci fornire i requisiti tecnici?",
+                    "How would you like to provide the technical requirements?"
+                ),
                 actions=actions,
             ).send()
-
         else:
-            # Fai la prossima domanda
             context = "\n".join(conversation)
             next_question = await cl.make_async(call_azure_llm)(
                 user_message=f"PREVIOUS CONTEXT:\n{context}\n\nAsk the next question.",
-                system_prompt=OTHER_SYSTEM_PROMPT_ASK
+                system_prompt=other_system_prompt_ask()
             )
             conversation.append(f"Q: {next_question}")
             cl.user_session.set("other_conversation", conversation)
             await cl.Message(content=f"💬 {next_question}").send()
-    
-    elif step == "choose_method":
-        await cl.Message(content="⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel).").send()
+        return
 
-    # --- STEP 3A: Gestione dell'Upload Excel ---
-    elif step == "upload_excel":
+    if step == "choose_method":
+        await cl.Message(
+            content=t(
+                "⚠️ **Usa i pulsanti sopra** per scegliere come proseguire (Chat o Excel).",
+                "⚠️ **Please use the buttons above** to select how you want to proceed (Chat or Excel)."
+            )
+        ).send()
+        return
+
+    # --- STEP 3A: Excel upload ---
+    if step == "upload_excel":
         if not message.elements:
-            await cl.Message(content="⚠️ Please upload the completed Excel file using the attachment button (📎).").send()
+            await cl.Message(
+                content=t(
+                    "⚠️ Carica il file Excel compilato usando il pulsante allegato (📎).",
+                    "⚠️ Please upload the completed Excel file using the attachment button (📎)."
+                )
+            ).send()
             return
 
         file = message.elements[0]
@@ -379,21 +430,20 @@ async def main(message: cl.Message):
             df.columns = df.columns.str.strip()
 
             if 'Answer' not in df.columns:
-                await cl.Message(content="⚠️ Cannot find the column **'Answer'** in your uploaded file. Please add it, fill in your answers, and upload it again.").send()
+                await cl.Message(
+                    content=t(
+                        "⚠️ Non trovo la colonna **'Answer'** nel file caricato. Aggiungila, compila le risposte e carica di nuovo il file.",
+                        "⚠️ Cannot find the column **'Answer'** in your uploaded file. Please add it, fill in your answers, and upload it again."
+                    )
+                ).send()
                 return
 
             normalized_questions = {q.strip(): q for q in questions}
-
-             # DEBUG
-            print("normalized_questions keys:", list(normalized_questions.keys())[:3])
 
             rows_to_validate = []
             for index, row in df.iterrows():
                 q_raw = str(row.get('Question', '')).strip()
                 a = row.get('Answer')
-
-                # DEBUG
-                print(f"Row {index} | q_raw: '{q_raw}' | in normalized: {q_raw in normalized_questions} | a: '{a}'")
 
                 if q_raw not in normalized_questions:
                     continue
@@ -401,10 +451,19 @@ async def main(message: cl.Message):
                     continue
                 rows_to_validate.append((q_raw, normalized_questions[q_raw], str(a).strip()))
 
-            await cl.Message(content=f"🔄 Validating **{len(rows_to_validate)}** answers in parallel, please wait...").send()
+            await cl.Message(
+                content=t(
+                    f"🔄 Validazione di **{len(rows_to_validate)}** risposte in parallelo, attendere...",
+                    f"🔄 Validating **{len(rows_to_validate)}** answers in parallel, please wait..."
+                )
+            ).send()
+
+            lang_code = get_lang()
 
             def validate_single(q_raw: str, answer_text: str) -> dict:
-                validation_prompt = f"""You are an expert IAM technical consultant reviewing onboarding questionnaire answers.
+                # Reason must be in selected language (user-visible)
+                validation_prompt = f"""{user_lang_instruction()}
+You are an expert IAM technical consultant reviewing onboarding questionnaire answers.
 
 QUESTION: "{q_raw}"
 ANSWER: "{answer_text}"
@@ -415,7 +474,7 @@ Accept it unless it is completely meaningless or a clear refusal.
 Reply ONLY with valid JSON:
 {{
     "valid": true | false,
-    "reason": "One sentence explanation in English"
+    "reason": "One sentence explanation in the selected language"
 }}
 """
                 validation_str = call_azure_llm(user_message="", system_prompt=validation_prompt, json_mode=True)
@@ -424,14 +483,18 @@ Reply ONLY with valid JSON:
                     result = json.loads(clean)
                     return {
                         "question": q_raw,
-                        "valid": result.get("valid", False),
-                        "reason": result.get("reason", "No reason provided.")
+                        "valid": bool(result.get("valid", False)),
+                        "reason": result.get("reason", t("Motivo non disponibile.", "No reason provided.", lang=lang_code))
                     }
                 except Exception:
                     return {
                         "question": q_raw,
                         "valid": False,
-                        "reason": f"Could not parse response: {validation_str[:200]}"
+                        "reason": t(
+                            f"Impossibile interpretare la risposta del validatore: {validation_str[:200]}",
+                            f"Could not parse validator response: {validation_str[:200]}",
+                            lang=lang_code
+                        )
                     }
 
             loop = asyncio.get_event_loop()
@@ -458,36 +521,55 @@ Reply ONLY with valid JSON:
 
             cl.user_session.set("answers", answers)
 
-            await cl.Message(content=f"✅ **File processed successfully!** Extracted **{extracted_count}** valid answers.").send()
+            await cl.Message(
+                content=t(
+                    f"✅ **File elaborato con successo!** Estratte **{extracted_count}** risposte valide.",
+                    f"✅ **File processed successfully!** Extracted **{extracted_count}** valid answers."
+                )
+            ).send()
 
             if invalid_answers:
-                warning_lines = ["⚠️ **The following answers were flagged as insufficient and skipped:**\n"]
+                warning_lines = [t(
+                    "⚠️ **Le seguenti risposte sono risultate insufficienti e sono state ignorate:**\n",
+                    "⚠️ **The following answers were flagged as insufficient and skipped:**\n"
+                )]
                 for item in invalid_answers:
-                    warning_lines.append(f"- **Q:** {item['question']}\n  **A:** {item['answer']}\n  **Reason:** {item['reason']}")
+                    warning_lines.append(
+                        t(
+                            f"- **Q:** {item['question']}\n  **A:** {item['answer']}\n  **Motivo:** {item['reason']}",
+                            f"- **Q:** {item['question']}\n  **A:** {item['answer']}\n  **Reason:** {item['reason']}"
+                        )
+                    )
                 await cl.Message(content="\n\n".join(warning_lines)).send()
 
             cl.user_session.set("step", "conversational_chat")
-            await ask_next_question(last_user_input="I have uploaded the Excel file. Please review.")
+            await ask_next_question(last_user_input=t(
+                "Ho caricato il file Excel. Per favore, revisiona le risposte.",
+                "I have uploaded the Excel file. Please review."
+            ))
 
         except Exception as e:
-            await cl.Message(content=f"⚠️ Error reading the file. Ensure it's a valid Excel format. Error details: {str(e)}").send()
+            await cl.Message(
+                content=t(
+                    f"⚠️ Errore nella lettura del file. Assicurati che sia un Excel valido. Dettagli: {str(e)}",
+                    f"⚠️ Error reading the file. Ensure it's a valid Excel format. Error details: {str(e)}"
+                )
+            ).send()
+        return
 
-
-
-    # --- STEP 3: Conversational Chat (Extraction, Validation, Explanation, CORRECTION) ---
-    elif step == "conversational_chat":
-        questions = cl.user_session.get("questions")
-        
-        # Recuperiamo la domanda specifica che l'LLM ha deciso di fare al giro precedente
+    # --- STEP 3: Conversational Chat ---
+    if step == "conversational_chat":
+        questions = cl.user_session.get("questions") or []
         current_question = cl.user_session.get("current_asked_question")
         pending_questions = [q for q in questions if q not in answers or not answers[q]]
-        
+
         if not pending_questions and not message.content:
-            return # Interview already completed
-            
-        async with cl.Step(name="Intent and Data Analysis"):
-            # UNIFIED PROMPT: Valida, Estrae multipli target, e gestisce CORREZIONI
-            system_prompt_orchestrator = f"""You are an expert technical assistant in IAM (Identity and Access Management).
+            return
+
+        async with cl.Step(name=step_name("intent_analysis")):
+            lang_code = get_lang()
+            system_prompt_orchestrator = f"""{user_lang_instruction()}
+You are an expert technical assistant in IAM (Identity and Access Management).
 Your goal is to gather technical information from a user.
 
 CURRENT QUESTION ASKED TO THE USER: "{current_question}"
@@ -499,62 +581,94 @@ ALREADY ANSWERED QUESTIONS (Current State):
 {json.dumps(answers, ensure_ascii=False)}
 
 ANALYZE THE USER'S MESSAGE AND CHOOSE ONE OF 3 ACTIONS:
-1. "clarification": The user didn't understand the question, asks "what does it mean?", or asks for help. Provide a technical explanation in "message" (in the same language the user speaks).
-2. "invalid": The user tries to answer, but the response is "I don't know" or too vague to be accepted. Explain why you need more details in "message" (in the same language the user speaks).
-3. "success": The user provides a valid answer AND/OR corrects a previously given answer. 
-   - Extract the answer. 
+1. "clarification": The user didn't understand the question, asks "what does it mean?", or asks for help. Provide a technical explanation in "message" (in the selected language, not in the user's typed language).
+2. "invalid": The user tries to answer, but the response is "I don't know" or too vague to be accepted. Explain why you need more details in "message" (in the selected language, not in the user's typed language).
+3. "success": The user provides a valid answer AND/OR corrects a previously given answer.
+   - Extract the answer.
    - CRITICAL RULE: Extract the answer in the EXACT SAME LANGUAGE the user wrote it (e.g., if the user answers in Italian, the extracted text MUST be in Italian). DO NOT translate it to English.
    - Map the new information to ANY relevant question in 'REMAINING QUESTIONS TO BE SATISFIED'.
    - IMPORTANT CORRECTION RULE: If the user states they made a mistake or explicitly provides updated information for a topic they already answered, map the new data to the exact question string found in 'ALREADY ANSWERED QUESTIONS'.
-   - Use "message" to give a brief success feedback (in the same language the user speaks).
+   - Use "message" to give a brief success feedback (in the selected language, not in the user's typed language).
 
 REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
 {{
     "status": "clarification" | "invalid" | "success",
-    "message": "Your response message for the user",
+    "message": "Your response message for the user (selected language only)",
     "extracted_data": {{
-        "EXACT text of the question (either from REMAINING or ALREADY ANSWERED array)": "Extracted, cleaned, and summarized answer in the USER'S ORIGINAL LANGUAGE"
+        "EXACT text of the question (either from REMAINING or ALREADY ANSWERED array)": "Extracted, cleaned, and summarized answer in the USER'S ORIGINAL TYPED LANGUAGE"
     }}
 }}
 Note: "extracted_data" must be populated ONLY if status is "success"."""
 
-            analysis_str = call_azure_llm(user_message=message.content, system_prompt=system_prompt_orchestrator)
+            analysis_str = await cl.make_async(call_azure_llm)(
+                user_message=message.content,
+                system_prompt=system_prompt_orchestrator
+            )
             print(f"\n--- DEBUG RISPOSTA API ---\n{analysis_str}\n--------------------------\n")
+
         try:
             clean_json = analysis_str.replace("```json", "").replace("```", "").strip()
             analysis = json.loads(clean_json)
-            
+
             status = analysis.get("status", "error")
-            response_message = analysis.get("message", "Comprehension error.")
+            response_message = analysis.get("message", t("Errore di comprensione.", "Comprehension error."))
             extracted_data = analysis.get("extracted_data", {})
 
-            if status == "clarification" or status == "invalid":
+            if status in ("clarification", "invalid"):
                 await cl.Message(content=f"💡 {response_message}").send()
-                await cl.Message(content=f"---\n**Getting back to our setup:** {current_question}").send()
-                
+                await cl.Message(content=t(
+                    f"---\n**Torniamo alla configurazione:** {current_question}",
+                    f"---\n**Getting back to our setup:** {current_question}"
+                )).send()
+
             elif status == "success":
-                # Salva sia le risposte nuove che le CORREZIONI di quelle vecchie
                 for q, a in extracted_data.items():
-                    if q in questions: # Controlla che la domanda esista nell'Excel
+                    if q in questions:
                         if q in answers:
-                            # Era già stata risposta -> CORREZIONE
-                            await cl.Message(content=f"🔄 *Updated requirement:* **{q}** \n> {a}").send()
+                            await cl.Message(content=t(
+                                f"🔄 *Requisito aggiornato:* **{q}** \n> {a}",
+                                f"🔄 *Updated requirement:* **{q}** \n> {a}"
+                            )).send()
                         else:
-                            # È una domanda nuova -> NUOVO INSERIMENTO
-                            await cl.Message(content=f"✅ *Saved requirement:* **{q}** \n> {a}").send()
-                        answers[q] = a # Aggiorna o crea la chiave nel dizionario
-                
+                            await cl.Message(content=t(
+                                f"✅ *Requisito salvato:* **{q}** \n> {a}",
+                                f"✅ *Saved requirement:* **{q}** \n> {a}"
+                            )).send()
+                        answers[q] = a
+
                 cl.user_session.set("answers", answers)
                 await cl.Message(content=response_message).send()
-                
-                # Chiediamo la PROSSIMA domanda
                 await ask_next_question(last_user_input=message.content)
-                
+
             else:
-                await cl.Message(content=f"⚠️ API Error Details: {response_message}").send()
+                await cl.Message(content=t(
+                    f"⚠️ Dettagli errore API: {response_message}",
+                    f"⚠️ API Error Details: {response_message}"
+                )).send()
 
         except json.JSONDecodeError:
-            await cl.Message(content="⚠️ *The server responded in an unexpected format. Please try again.*").send()
+            await cl.Message(content=t(
+                "⚠️ *Il server ha risposto in un formato inatteso. Riprova.*",
+                "⚠️ *The server responded in an unexpected format. Please try again.*"
+            )).send()
+        return
+
+
+# ==========================================
+# CALLBACK: Language Selection
+# ==========================================
+@cl.action_callback("choose_language")
+async def on_choose_language(action: cl.Action):
+    lang_code = action.payload.get("value")
+    set_language(lang_code)
+
+    cl.user_session.set("step", "company")
+    await cl.Message(
+        content=t(
+            "Perfetto. Inserisci il **nome della company**:",
+            "Great. Please enter the **Company Name**:"
+        )
+    ).send()
 
 
 # ==========================================
@@ -566,20 +680,18 @@ async def on_choose_type(action: cl.Action):
         system_type = action.payload.get("value")
 
         if system_type == "Others":
-            # Inizializza lo stato per il flusso "Others"
             cl.user_session.set("step", "other_identification")
             cl.user_session.set("other_conversation", [])
             cl.user_session.set("other_exchange_count", 0)
 
-            # Genera la prima domanda e inviala come messaggio normale
-            first_question = call_azure_llm(
+            first_question = await cl.make_async(call_azure_llm)(
                 user_message="PREVIOUS CONTEXT:\nNo previous context yet.\n\nAsk the next question.",
-                system_prompt=OTHER_SYSTEM_PROMPT_ASK
+                system_prompt=other_system_prompt_ask()
             )
+            cl.user_session.set("other_conversation", [f"Q: {first_question}"])
             await cl.Message(content=f"💬 {first_question}").send()
-            return  # <-- IL CALLBACK TERMINA QUI
+            return
 
-        # Per tutti gli altri tipi (AD-Azure, SAP, LDAP) il flusso rimane invariato
         cl.user_session.set("system_type", system_type)
         questions = await cl.make_async(load_questions_from_DB)(system_type)
         cl.user_session.set("questions", questions)
@@ -590,8 +702,6 @@ async def on_choose_type(action: cl.Action):
 
         def build_excel():
             from openpyxl import load_workbook
-            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
 
             df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
             wb = load_workbook(file_path)
@@ -622,131 +732,24 @@ async def on_choose_type(action: cl.Action):
         await cl.make_async(build_excel)()
 
         actions = [
-            cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
-            cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
+            cl.Action(name="choose_method", payload={"value": "chat"}, label=t("💬 Continua in chat", "💬 Continue in Chat")),
+            cl.Action(name="choose_method", payload={"value": "excel"}, label=t("📊 Scarica & Carica Excel", "📊 Download & Upload Excel")),
         ]
         await cl.Message(
-            content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
+            content=t(
+                f"✅ Tipo sistema **{system_type}** selezionato.\n\nCome preferisci fornire i requisiti tecnici?",
+                f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?"
+            ),
             actions=actions,
         ).send()
 
     except Exception as e:
-        await cl.Message(content=f"❌ Errore durante la selezione del target system: `{e}`").send()
+        await cl.Message(content=t(
+            f"❌ Errore durante la selezione del target system: `{e}`",
+            f"❌ Error while selecting the target system: `{e}`"
+        )).send()
         raise
 
-async def _send_method_choice(system_type: str):
-    """Invia i bottoni choose_method in un contesto pulito, fuori dal callback."""
-    await asyncio.sleep(0.5)
-
-    cl.user_session.set("step", "choose_method")
-
-    actions = [
-        cl.Action(name="choose_method", payload={"value": "chat"}, label="💬 Continue in Chat"),
-        cl.Action(name="choose_method", payload={"value": "excel"}, label="📊 Download & Upload Excel"),
-    ]
-
-    await cl.Message(
-        content=f"✅ System type **{system_type}** selected.\n\nHow would you like to provide the technical requirements?",
-        actions=actions,
-    ).send()
-
-# Corrected async function: fixes early-stop bug by requiring a minimum
-# number of Q&A exchanges and a "CONFIDENT" flag before stopping early.
-# The evaluation LLM now returns "label|confidence" internally, but only
-# "Target DB" or "Generic" are ever shown to the user or returned.
-
-async def on_choose_other_target_system_type() -> str:
-    max_questions = 7
-    min_questions = 3  # Minimum number of Q&A exchanges before early-stop is allowed
-    conversation_history = []
-
-    system_prompt_ask = """You are a Senior Technical Consultant conducting a formal IAM integration assessment.
-Your aim is to understand what is the target system type in order to integrate it in the IGA system.
-You only know that the target system is not AD, Azure, SAP, nor LDAP; but you don't know what's the intended integration method, you have to discover it.
-Keep in mind that the user doesn't know what it means to integrate a target system in an IGA system, you have to inquiry him on all the possible integration methods - APIs, DBs, ...
-
-INSTRUCTIONS:
-1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about.
-2. Ask the ONE question that logically follows the previous context to keep a fluid conversation.
-3. Use a highly professional, polite, and formal B2B tone.
-4. Be precise and clear. Do NOT use informal greetings.
-
-Reply ONLY and EXCLUSIVELY with the question you want to ask."""
-
-    system_prompt_evaluate = """You are an expert system architect performing a rigorous technical classification.
-Carefully analyze the ENTIRE conversation below before deciding — do not rely only on the last message.
-Determine whether the target system integration is a "Target DB" or "Generic".
-
-Classification rules (apply equal rigor to both labels — never treat one as a default fallback):
-- "Target DB": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the system's user/account data is managed via direct database access (e.g. explicit mention of SQL, stored procedures, direct read/write on DB tables).
-- "Generic": use this label ONLY if the conversation contains EXPLICIT and UNAMBIGUOUS evidence that the integration method is something OTHER than direct database access (e.g. explicit mention of APIs, web services, connectors, flat files, or any other non-DB method).
-
-You must ALWAYS provide your best-guess label, even if the evidence is vague or incomplete — never refuse to guess.
-Additionally, provide a confidence flag:
-- Reply "CONFIDENT" ONLY if there is explicit, unambiguous evidence in the conversation clearly supporting your chosen label.
-- Otherwise, reply "NOT_CONFIDENT" while still providing your best-guess label (do not default to "Generic" for convenience — justify it with the same rigor as "Target DB").
-
-Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character, in this exact format:
-"Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
-
-    async with cl.Step(name="Identifying Target System Type"):
-        last_label = None  # Keeps track of the last evaluated label for best-effort fallback
-
-        for i in range(max_questions):
-            context = "\n".join(conversation_history) if conversation_history else "No previous context yet."
-            user_msg_for_llm = f"PREVIOUS CONTEXT:\n{context}\n\nAsk the next question."
-
-            question = call_azure_llm(
-                user_message=user_msg_for_llm,
-                system_prompt=system_prompt_ask
-            )
-
-            res = await cl.AskUserMessage(content=f"💬 {question}", timeout=300).send()
-
-            if res is None:
-                await cl.Message(content="⏱️ Timeout reached. Defaulting to 'Custom connector'.").send()
-                return "Custom connector"
-
-            user_answer = res["output"]
-            conversation_history.append(f"Q: {question}")
-            conversation_history.append(f"A: {user_answer}")
-
-            eval_context = "\n".join(conversation_history)
-            evaluation = call_azure_llm(
-                user_message=f"CONVERSATION:\n{eval_context}",
-                system_prompt=system_prompt_evaluate
-            )
-
-            # Parse the "label|confidence" response from the evaluation LLM.
-            raw_evaluation = evaluation.strip()
-            if "|" in raw_evaluation:
-                label_part, confidence_part = raw_evaluation.split("|", 1)
-                label = label_part.strip()
-                confidence = confidence_part.strip().upper()
-            else:
-                # Defensive fallback in case the LLM doesn't respect the format.
-                label = raw_evaluation.strip()
-                confidence = "NOT_CONFIDENT"
-
-            last_label = label  # Keep the most recent label for best-effort fallback at the end
-
-            # Only consider stopping early once at least min_questions exchanges
-            # have happened AND the evaluation is CONFIDENT.
-            enough_exchanges = (i + 1) >= min_questions
-            if enough_exchanges and confidence == "CONFIDENT":
-                await cl.Message(
-                    content=f"✅ Target system type identified: **{label}**"
-                ).send()
-                return label
-
-        # Max questions reached without a CONFIDENT evaluation:
-        # take the last evaluation's label as the best-effort final answer.
-        best_effort_label = last_label if last_label else "Generic"
-        await cl.Message(
-            content=f"⚠️ Maximum questions reached. Best-effort target system type: **{best_effort_label}**"
-        ).send()
-
-        return best_effort_label
 
 # ==========================================
 # CALLBACK: Method Selection (Chat vs Excel)
@@ -754,61 +757,67 @@ Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe charac
 @cl.action_callback("choose_method")
 async def on_choose_method(action: cl.Action):
     method = action.payload.get("value")
-    
+
     if method == "chat":
         cl.user_session.set("step", "conversational_chat")
         await ask_next_question(last_user_input="")
-        
+
     elif method == "excel":
         cl.user_session.set("step", "upload_excel")
-        
-        # Inviamo il file Excel esistente all'utente
+
         elements = [
             cl.File(
                 name="Obiettivi AI - Target Systems.xlsx",
-                path="Obiettivi AI - Target Systems.xlsx", # Il tuo file locale
+                path="Obiettivi AI - Target Systems.xlsx",
                 display="inline"
             )
         ]
-        
+
         await cl.Message(
-            content="📥 **Please download the Excel file attached above.**\n\n"
-                    "**Instructions:**\n"
-                    "1. Open the sheet corresponding to your system (**" + cl.user_session.get("system_type") + "**).\n"
-                    "2. Add a new column named exactly **Answer** next to the questions.\n"
-                    "3. Fill in your answers and save the file.\n\n"
-                    "When you are ready, **upload the completed file here** using the attachment button (📎).",
+            content=t(
+                "📥 **Scarica il file Excel allegato qui sopra.**\n\n"
+                "**Istruzioni:**\n"
+                "1. Apri il foglio corrispondente al tuo sistema (**" + cl.user_session.get("system_type") + "**).\n"
+                "2. Aggiungi una nuova colonna chiamata esattamente **Answer** accanto alle domande.\n"
+                "3. Compila le risposte e salva il file.\n\n"
+                "Quando sei pronto, **carica qui il file compilato** usando il pulsante allegato (📎).",
+                "📥 **Please download the Excel file attached above.**\n\n"
+                "**Instructions:**\n"
+                "1. Open the sheet corresponding to your system (**" + cl.user_session.get("system_type") + "**).\n"
+                "2. Add a new column named exactly **Answer** next to the questions.\n"
+                "3. Fill in your answers and save the file.\n\n"
+                "When you are ready, **upload the completed file here** using the attachment button (📎)."
+            ),
             elements=elements
         ).send()
+
 
 # ==========================================
 # FUNCTION: Asks the next question dynamically
 # ==========================================
 async def ask_next_question(last_user_input: str = ""):
-    questions = cl.user_session.get("questions")
-    answers = cl.user_session.get("answers")
-    
-    # Calcola quali domande mancano all'appello
+    questions = cl.user_session.get("questions") or []
+    answers = cl.user_session.get("answers") or {}
+
     pending_questions = [q for q in questions if q not in answers or not answers[q]]
-    
-    # --- BLOCCO 1: FINE INTERVISTA, TRADUZIONE E SALVATAGGIO DB ---
+
+    # --- END: Translation and DB save ---
     if not pending_questions:
         translated_answers = {}
-        
-        async with cl.Step(name="Elaborazione e Traduzione Dati"):
-            system_prompt_translate = """You are an expert IT technical translator. 
+
+        async with cl.Step(name=step_name("translate_save")):
+            system_prompt_translate = """You are an expert IT technical translator.
 I will provide a JSON dictionary containing questions as keys and user answers as values.
 Your task is to translate ALL the values (the answers) into professional IT English.
 If a value is already in English, keep it exactly as it is.
 CRITICAL: DO NOT translate or modify the keys (the questions).
 Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown, no greetings."""
 
-            # Chiamata all'LLM di Azure per la traduzione
-            translation_response = call_azure_llm(
-                user_message=json.dumps(answers, ensure_ascii=False), 
+            translation_response = await cl.make_async(call_azure_llm)(
+                user_message=json.dumps(answers, ensure_ascii=False),
                 system_prompt=system_prompt_translate
             )
-            
+
             try:
                 clean_json = translation_response.replace("```json", "").replace("```", "").strip()
                 translated_answers = json.loads(clean_json)
@@ -816,15 +825,13 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                 print(f"Errore durante la traduzione: {e}")
                 translated_answers = {"error": "Traduzione fallita", "raw_response": translation_response}
 
-        # Prepariamo i dati dalla sessione per il salvataggio
         company_name = cl.user_session.get("company")
         target_system_name = cl.user_session.get("system")
         system_type_name = cl.user_session.get("system_type")
 
-        print("\n" + "="*50 + "\n💾 [SALVATAGGIO NEL DATABASE IN CORSO...]\n" + "="*50)
-        
+        print("\n" + "=" * 50 + "\n💾 [SALVATAGGIO NEL DATABASE IN CORSO...]\n" + "=" * 50)
+
         try:
-            # Apriamo la connessione al DB e salviamo il record
             with get_db() as db:
                 nuova_sessione = OnboardingSession(
                     company=company_name,
@@ -835,26 +842,26 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                 )
                 db.add(nuova_sessione)
                 db.commit()
-                
+
                 print(f"✅ Dati salvati con successo per la company: {company_name}")
-                
+
         except Exception as e:
             print(f"❌ Errore critico durante il salvataggio nel DB: {e}")
 
-        # Messaggio finale all'utente
         await cl.Message(
-            content="🎉 **Interview completed.** We have successfully gathered all the necessary technical requirements.\n\nThe data has been securely saved to our system. Thank you for your time."
+            content=t(
+                "🎉 **Intervista completata.** Abbiamo raccolto con successo tutti i requisiti tecnici necessari.\n\nI dati sono stati salvati in modo sicuro nel nostro sistema. Grazie per il tuo tempo.",
+                "🎉 **Interview completed.** We have successfully gathered all the necessary technical requirements.\n\nThe data has been securely saved to our system. Thank you for your time."
+            )
         ).send()
-        
-        return # Termina l'esecuzione della funzione qui
+        return
 
-    # --- BLOCCO 2: SELEZIONE E INVIO DELLA PROSSIMA DOMANDA ---
-    
-    # Creiamo un dizionario numerato per evitare che l'LLM sbagli a copiare le stringhe
+    # --- Next question selection ---
     numbered_pending = {str(i): q for i, q in enumerate(pending_questions)}
 
-    async with cl.Step(name="Contextual Question Selection"):
-        system_prompt_ask = f"""You are a Senior Technical Consultant conducting a formal IAM integration assessment.
+    async with cl.Step(name=step_name("question_selection")):
+        system_prompt_ask = f"""{user_lang_instruction()}
+You are a Senior Technical Consultant conducting a formal IAM integration assessment.
 
 PREVIOUS CONTEXT / LAST USER MESSAGE:
 "{last_user_input if last_user_input else 'None. Start of the technical interview.'}"
@@ -864,7 +871,7 @@ REMAINING QUESTIONS TO ASK (Numbered Dictionary):
 
 INSTRUCTIONS:
 1. Analyze the PREVIOUS CONTEXT. Identify the main topics the user just talked about (e.g., AD, environments, users, groups, licenses, provisioning).
-2. Look at the REMAINING QUESTIONS TO ASK. Select the ONE question that logically and semantically follows the PREVIOUS CONTEXT to keep a fluid conversation. 
+2. Look at the REMAINING QUESTIONS TO ASK. Select the ONE question that logically and semantically follows the PREVIOUS CONTEXT to keep a fluid conversation.
 3. If there is no clear connection, or if it's the start of the interview, always select the question with index "0".
 4. Rephrase the selected question in a highly professional, polite, and formal B2B tone.
 5. Be precise and clear. Do NOT use informal greetings.
@@ -872,33 +879,36 @@ INSTRUCTIONS:
 Reply ONLY and EXCLUSIVELY with valid JSON in this format:
 {{
     "selected_target_index": "The string key of the chosen question from the dictionary (e.g., '0', '3', '5')",
-    "conversational_question": "Your rephrased, professional B2B question"
+    "conversational_question": "Your rephrased, professional B2B question (selected language only)"
 }}"""
 
-        # Chiamata all'LLM di Azure per selezionare la prossima domanda
-        response_str = call_azure_llm(user_message="", system_prompt=system_prompt_ask)
-        
+        response_str = await cl.make_async(call_azure_llm)(user_message="", system_prompt=system_prompt_ask)
+
         try:
             clean_json = response_str.replace("```json", "").replace("```", "").strip()
             data = json.loads(clean_json)
-            
-            # Recuperiamo la stringa originale della domanda usando l'ID scelto dall'LLM
+
             selected_index = str(data.get("selected_target_index", "0"))
-            
+
             if selected_index in numbered_pending:
                 target_question = numbered_pending[selected_index]
             else:
-                target_question = pending_questions[0] # Fallback di sicurezza
-                
-            conversational_question = data.get("conversational_question", f"Could you please provide information regarding this requirement: {target_question}")
-            
+                target_question = pending_questions[0]
+
+            conversational_question = data.get(
+                "conversational_question",
+                t(
+                    f"Potresti fornire informazioni su questo requisito: {target_question}",
+                    f"Could you please provide information regarding this requirement: {target_question}"
+                )
+            )
+
         except json.JSONDecodeError:
             target_question = pending_questions[0]
-            conversational_question = f"Could you please elaborate on the following requirement: {target_question}"
+            conversational_question = t(
+                f"Puoi approfondire il seguente requisito: {target_question}",
+                f"Could you please elaborate on the following requirement: {target_question}"
+            )
 
-    # Salva in sessione la domanda esatta che stiamo per fare
     cl.user_session.set("current_asked_question", target_question)
-    
-    # Invia la domanda all'utente
     await cl.Message(content=f"💬 {conversational_question}").send()
-
