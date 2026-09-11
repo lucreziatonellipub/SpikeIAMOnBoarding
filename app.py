@@ -224,6 +224,7 @@ async def start():
     cl.user_session.set("step", "language")
     cl.user_session.set("lang_code", None)
     cl.user_session.set("lang_name", None)
+    cl.user_session.set("finalization_started", False)
 
     actions = [
         cl.Action(name="choose_language", payload={"value": LANG_IT}, label="Italiano"),
@@ -240,6 +241,10 @@ async def start():
 async def main(message: cl.Message):
     step = cl.user_session.get("step")
     answers = cl.user_session.get("answers") or {}
+
+    # --- GUARD: Silent exit if already finalizing/completed ---
+    if step in ("finalizing", "completed"):
+        return
 
     # --- STEP 0: Language ---
     if step == "language":
@@ -756,6 +761,12 @@ async def on_choose_type(action: cl.Action):
 # ==========================================
 @cl.action_callback("choose_method")
 async def on_choose_method(action: cl.Action):
+    step = cl.user_session.get("step")
+    if step in ("finalizing", "completed"):
+        return
+    if step != "choose_method":
+        return
+
     method = action.payload.get("value")
 
     if method == "chat":
@@ -796,6 +807,10 @@ async def on_choose_method(action: cl.Action):
 # FUNCTION: Asks the next question dynamically
 # ==========================================
 async def ask_next_question(last_user_input: str = ""):
+    step = cl.user_session.get("step")
+    if step in ("finalizing", "completed"):
+        return
+
     questions = cl.user_session.get("questions") or []
     answers = cl.user_session.get("answers") or {}
 
@@ -803,6 +818,14 @@ async def ask_next_question(last_user_input: str = ""):
 
     # --- END: Translation and DB save ---
     if not pending_questions:
+        # Prevent duplicate finalization in the same session (double calls / race conditions)
+        if cl.user_session.get("finalization_started"):
+            return
+        cl.user_session.set("finalization_started", True)
+
+        # Set state to finalizing BEFORE translation and save to prevent re-entry
+        cl.user_session.set("step", "finalizing")
+
         translated_answers = {}
 
         async with cl.Step(name=step_name("translate_save")):
@@ -829,8 +852,7 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
         target_system_name = cl.user_session.get("system")
         system_type_name = cl.user_session.get("system_type")
 
-        print("\n" + "=" * 50 + "\n💾 [SALVATAGGIO NEL DATABASE IN CORSO...]\n" + "=" * 50)
-
+        db_saved_successfully = False
         try:
             with get_db() as db:
                 nuova_sessione = OnboardingSession(
@@ -843,17 +865,21 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                 db.add(nuova_sessione)
                 db.commit()
 
+                db_saved_successfully = True
                 print(f"✅ Dati salvati con successo per la company: {company_name}")
 
         except Exception as e:
             print(f"❌ Errore critico durante il salvataggio nel DB: {e}")
 
-        await cl.Message(
-            content=t(
-                "🎉 **Intervista completata.** Abbiamo raccolto con successo tutti i requisiti tecnici necessari.\n\nI dati sono stati salvati in modo sicuro nel nostro sistema. Grazie per il tuo tempo.",
-                "🎉 **Interview completed.** We have successfully gathered all the necessary technical requirements.\n\nThe data has been securely saved to our system. Thank you for your time."
-            )
-        ).send()
+        # Reset current question pointer and mark session completed
+        cl.user_session.set("current_asked_question", None)
+        cl.user_session.set("step", "completed")
+
+        if db_saved_successfully:
+            await cl.Message(content="**Interview completed.** We have successfully gathered all the necessary technical requirements. The data has been securely saved to our system. Thank you for your time.").send()
+        else:
+            await cl.Message(content="**Interview completed.** We have gathered all the necessary technical requirements. **Saving issue:** we could not save the data to our system. Please contact support and provide the company name and target system.").send()
+
         return
 
     # --- Next question selection ---
