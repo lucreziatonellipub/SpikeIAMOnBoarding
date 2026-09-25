@@ -586,24 +586,46 @@ ALREADY ANSWERED QUESTIONS (Current State):
 {json.dumps(answers, ensure_ascii=False)}
 
 ANALYZE THE USER'S MESSAGE AND CHOOSE ONE OF 3 ACTIONS:
-1. "clarification": The user didn't understand the question, asks "what does it mean?", or asks for help. Provide a technical explanation in "message" (in the selected language, not in the user's typed language).
-2. "invalid": The user tries to answer, but the response is "I don't know" or too vague to be accepted. Explain why you need more details in "message" (in the selected language, not in the user's typed language).
-3. "success": The user provides a valid answer AND/OR corrects a previously given answer.
+
+1. "clarification": The user did not understand the question, asks what it means, or asks for help.
+   - Provide a technical explanation in "message" using the selected language, not necessarily the language typed by the user.
+
+2. "invalid": The user tries to answer, but the response is "I don't know" or is too vague to be accepted.
+   - Explain why more details are needed in "message", using the selected language.
+
+3. "success": The user provides a valid answer and/or corrects a previously provided answer.
    - Extract the answer.
-   - CRITICAL RULE: Extract the answer in the EXACT SAME LANGUAGE the user wrote it (e.g., if the user answers in Italian, the extracted text MUST be in Italian). DO NOT translate it to English.
-   - Map the new information to ANY relevant question in 'REMAINING QUESTIONS TO BE SATISFIED'.
-   - IMPORTANT CORRECTION RULE: If the user states they made a mistake or explicitly provides updated information for a topic they already answered, map the new data to the exact question string found in 'ALREADY ANSWERED QUESTIONS'.
-   - Use "message" to give a brief success feedback (in the selected language, not in the user's typed language).
+   - CRITICAL LANGUAGE RULE: Keep the extracted answer in the EXACT SAME LANGUAGE used by the user. Do not translate it.
+   - Map the new information to every relevant question in "REMAINING QUESTIONS TO BE SATISFIED".
+   - CORRECTION RULE: If the user explicitly corrects or updates previously provided information, map the updated data to the exact question string found in "ALREADY ANSWERED QUESTIONS".
+   - Use "message" to provide brief success feedback in the selected language.
+
+OTHER INFORMATION EXTRACTION:
+- Extract additional useful information provided by the user that does not directly answer any question in "REMAINING QUESTIONS TO BE SATISFIED" or update any question in "ALREADY ANSWERED QUESTIONS".
+- Store this information in "other_infos".
+- Keep each item in the EXACT SAME LANGUAGE used by the user. Do not translate it.
+- Clean and summarize each item without changing its meaning.
+- Do not duplicate information already stored in "extracted_data".
+- Ignore greetings, conversational filler, and irrelevant statements.
+- If no additional useful information is present, return an empty array.
+- Additional information alone does not make the response successful. Use "success" only when the user provides or corrects a valid answer.
 
 REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
+
 {{
     "status": "clarification" | "invalid" | "success",
-    "message": "Your response message for the user (selected language only)",
+    "message": "Response for the user in the selected language",
     "extracted_data": {{
-        "EXACT text of the question (either from REMAINING or ALREADY ANSWERED array)": "Extracted, cleaned, and summarized answer in the USER'S ORIGINAL TYPED LANGUAGE"
+        "EXACT question text from REMAINING QUESTIONS TO BE SATISFIED or ALREADY ANSWERED QUESTIONS": "Extracted, cleaned, and summarized answer in the user's original typed language",
+        "other_infos": [
+                "Additional useful information in the user's original typed language"
+        ]
     }}
 }}
-Note: "extracted_data" must be populated ONLY if status is "success"."""
+
+RULES:
+- "extracted_data" must be populated only when "status" is "success". Otherwise, return an empty object.
+- "other_infos" must always be present. Return an empty array when there is no additional useful information."""
 
             analysis_str = await cl.make_async(call_azure_llm)(
                 user_message=message.content,
@@ -618,6 +640,34 @@ Note: "extracted_data" must be populated ONLY if status is "success"."""
             status = analysis.get("status", "error")
             response_message = analysis.get("message", t("Errore di comprensione.", "Comprehension error."))
             extracted_data = analysis.get("extracted_data", {})
+
+            # Safe extraction/normalization for other_infos (must be a list)
+            other_infos = analysis.get("other_infos", [])
+            if other_infos is None:
+                other_infos = []
+            elif isinstance(other_infos, list):
+                pass
+            elif isinstance(other_infos, str):
+                other_infos = [other_infos] if other_infos.strip() else []
+            else:
+                # Any other single non-null value becomes a one-item list
+                other_infos = [other_infos]
+
+            # Readable log (preserve Unicode)
+            print(
+                "\n--- LOG ORCHESTRATOR PARSED ---\n"
+                + json.dumps(
+                    {
+                        "status": status,
+                        "message": response_message,
+                        "extracted_data": extracted_data,
+                        "other_infos": other_infos,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n------------------------------\n"
+            )
 
             if status in ("clarification", "invalid"):
                 await cl.Message(content=f"💡 {response_message}").send()
@@ -825,7 +875,7 @@ async def ask_next_question(last_user_input: str = ""):
 
         # Set state to finalizing BEFORE translation and save to prevent re-entry
         cl.user_session.set("step", "finalizing")
-
+        
         translated_answers = {}
 
         async with cl.Step(name=step_name("translate_save")):
@@ -852,8 +902,8 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
         target_system_name = cl.user_session.get("system")
         system_type_name = cl.user_session.get("system_type")
 
-        answers_to_save = convert_answers(answers)
-        translated_answers_to_save = convert_answers(translated_answers)
+        #answers_to_save = convert_answers(answers)
+        #translated_answers_to_save = convert_answers(translated_answers)
 
         db_saved_successfully = False
         try:
@@ -862,8 +912,8 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                     company=company_name,
                     target_system=target_system_name,
                     system_type=system_type_name,
-                    collected_data_original=answers_to_save,
-                    collected_data_english=translated_answers_to_save
+                    collected_data_original=answers, #answers_to_save,
+                    collected_data_english=translated_answers #translated_answers_to_save
                 )
                 db.add(nuova_sessione)
                 db.commit()
