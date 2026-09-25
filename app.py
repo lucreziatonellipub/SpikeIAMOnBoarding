@@ -852,6 +852,9 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
         target_system_name = cl.user_session.get("system")
         system_type_name = cl.user_session.get("system_type")
 
+        answers_to_save = convert_answers(answers)
+        translated_answers_to_save = convert_answers(translated_answers)
+
         db_saved_successfully = False
         try:
             with get_db() as db:
@@ -859,8 +862,8 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                     company=company_name,
                     target_system=target_system_name,
                     system_type=system_type_name,
-                    collected_data_original=answers,
-                    collected_data_english=translated_answers
+                    collected_data_original=answers_to_save,
+                    collected_data_english=translated_answers_to_save
                 )
                 db.add(nuova_sessione)
                 db.commit()
@@ -938,3 +941,11 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
 
     cl.user_session.set("current_asked_question", target_question)
     await cl.Message(content=f"💬 {conversational_question}").send()
+
+def convert_answers(data):
+    return {
+        question: value
+        if isinstance(value, dict) and "answer" in value
+        else {"answer": value}
+        for question, value in data.items()
+    }
