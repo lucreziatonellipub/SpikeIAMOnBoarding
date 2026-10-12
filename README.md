@@ -117,3 +117,13 @@ Il progetto è attualmente in fase Alpha. I prossimi step di sviluppo previsti s
 * [x] **Lettura dinamica delle domande:** Spostare le domande (attualmente hardcoded in Python) in un file di configurazione esterno (Excel) o in una tabella del database. Questo permetterà di creare questionari dinamici a seconda del tipo di sistema (es. Web App vs Database).
 * [ ] **Strutturazione del Template Excel:** Disegnare e generare dinamicamente il file `template_onboarding.xlsx` in modo che rispecchi esattamente le domande caricate a sistema, inserendo la logica Pandas per il parsing riga per riga del file caricato dall'utente.
 * [x] **Integrazione Database Self-Hosted:** Implementato salvataggio strutturato in **PostgreSQL** (tramite Docker e SQLAlchemy) per memorizzare in modo persistente le anagrafiche aziendali, i sistemi target e il JSON validato e tradotto delle risposte.
+
+## Document-assisted onboarding
+
+Attach one PDF, DOCX, TXT, MD, CSV, or XLSX document at any active point in the conversation. A dedicated document-understanding agent immediately detects the dominant language and extracts the company, target-system name, and system type when the source contains enough evidence. It then loads the corresponding questionnaire, fills every supported answer, and asks only for missing details. Explicit values entered or selected by the user take precedence over document-derived values.
+
+Complete answers are displayed and included in the existing database save and translation flow. Partial facts are retained as context so follow-up questions ask for missing details. Users can correct imported answers in chat. Each accepted extraction requires a literal source excerpt, retained in session state.
+
+Several documents can be supplied during the same conversation, one file per upload. Their contents are combined so later files can complete earlier answers. Limits: 20 MB per file and 120,000 extracted characters across the conversation; UTF-8 text files. PDFs must contain selectable text (OCR is not included). Documents exceeding the limits are rejected rather than silently truncated. In the dedicated completed-Excel step, an XLSX upload is treated as the questionnaire template; other uploads are treated as source documents. Install the updated requirements to enable PDF extraction.
+
+Run document tests with `python -m unittest discover -s tests`. Live agent output requires configured Azure credentials and the questionnaire database.

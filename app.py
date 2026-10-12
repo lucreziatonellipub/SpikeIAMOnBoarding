@@ -1,4 +1,5 @@
 import chainlit as cl
+from document_agent import MAX_CHARS, read_document, understand_document, understand_document_context
 import requests
 import pandas as pd
 import json
@@ -57,6 +58,8 @@ def step_name(key: str) -> str:
         "validation_excel": ( "Validazione risposte Excel", "Excel answers validation"),
         "translate_save": ( "Elaborazione e traduzione dati", "Data processing & translation"),
         "question_selection": ( "Selezione domanda contestuale", "Contextual Question Selection"),
+        "document_context": ("Analisi contesto documento", "Document context analysis"),
+        "document_answers": ("Analisi risposte documento", "Document answers analysis"),
     }
     it, en = names.get(key, (key, key))
     return t(it, en)
@@ -220,6 +223,11 @@ Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe charac
 # ==========================================
 @cl.on_chat_start
 async def start():
+    cl.user_session.set("document_text", None)
+    cl.user_session.set("document_names", [])
+    cl.user_session.set("document_context_evidence", {})
+    cl.user_session.set("document_partial", {})
+    cl.user_session.set("document_evidence", {})
     cl.user_session.set("answers", {})
     cl.user_session.set("step", "language")
     cl.user_session.set("lang_code", None)
@@ -232,7 +240,7 @@ async def start():
     ]
 
     await cl.Message(
-        content="### Spike IAM Onboarding\n\nSeleziona la lingua / Select your language:",
+        content="### Spike IAM Onboarding\n\nSeleziona la lingua / Select your language:\n\nPuoi allegare un documento (PDF, DOCX, TXT, MD, CSV, XLSX; max 20 MB) ora o in qualsiasi momento della conversazione. / You can attach a document (PDF, DOCX, TXT, MD, CSV, XLSX; max 20 MB) now or at any point in the conversation.",
         actions=actions
     ).send()
 
@@ -246,6 +254,22 @@ async def main(message: cl.Message):
     if step in ("finalizing", "completed"):
         return
 
+    # A normal document can be supplied at every active step. In the dedicated
+    # Excel step, an XLSX remains the completed questionnaire upload.
+    is_questionnaire_upload = (
+        step == "upload_excel"
+        and message.elements
+        and len(message.elements) == 1
+        and os.path.splitext(message.elements[0].name)[1].lower() == ".xlsx"
+    )
+    if message.elements and not is_questionnaire_upload:
+        if len(message.elements) != 1:
+            await cl.Message(content=t("Carica un solo documento alla volta.", "Upload one document at a time.")).send()
+            return
+        file = message.elements[0]
+        await process_document_upload(file)
+        return
+
     # --- STEP 0: Language ---
     if step == "language":
         await cl.Message(content=require_buttons_warning_language_step()).send()
@@ -254,6 +278,9 @@ async def main(message: cl.Message):
     # --- STEP 1: Company ---
     if step == "company":
         cl.user_session.set("company", message.content)
+        if cl.user_session.get("document_text"):
+            await continue_after_document_analysis()
+            return
         cl.user_session.set("step", "system")
         await cl.Message(
             content=t(
@@ -266,6 +293,9 @@ async def main(message: cl.Message):
     # --- STEP 2: System name ---
     if step == "system":
         cl.user_session.set("system", message.content)
+        if cl.user_session.get("document_text"):
+            await continue_after_document_analysis()
+            return
         cl.user_session.set("step", "system_type")
 
         actions = [
@@ -347,6 +377,9 @@ async def main(message: cl.Message):
             cl.user_session.set("system_type", system_type)
             questions = await cl.make_async(load_questions_from_DB)(system_type)
             cl.user_session.set("questions", questions)
+            if cl.user_session.get("document_text"):
+                await apply_document_answers()
+                return
             cl.user_session.set("step", "choose_method")
 
             file_path = "Obiettivi AI - Target Systems.xlsx"
@@ -579,6 +612,9 @@ Your goal is to gather technical information from a user.
 
 CURRENT QUESTION ASKED TO THE USER: "{current_question}"
 
+DOCUMENT FACTS FOR INCOMPLETE ANSWERS (combine with the user response; do not discard these facts):
+{json.dumps(cl.user_session.get("document_partial") or {}, ensure_ascii=False)}
+
 REMAINING QUESTIONS TO BE SATISFIED:
 {json.dumps(pending_questions, ensure_ascii=False)}
 
@@ -702,14 +738,20 @@ RULES:
 # ==========================================
 @cl.action_callback("choose_language")
 async def on_choose_language(action: cl.Action):
+    if cl.user_session.get("step") != "language":
+        return
     lang_code = action.payload.get("value")
     set_language(lang_code)
+
+    if cl.user_session.get("document_text"):
+        await continue_after_document_analysis()
+        return
 
     cl.user_session.set("step", "company")
     await cl.Message(
         content=t(
-            "Perfetto. Inserisci il **nome della company**:",
-            "Great. Please enter the **Company Name**:"
+            "Perfetto. Inserisci il **nome della company**. Puoi anche allegare un documento:",
+            "Great. Please enter the **Company Name**. You can also attach a document now:"
         )
     ).send()
 
@@ -720,6 +762,8 @@ async def on_choose_language(action: cl.Action):
 @cl.action_callback("choose_type")
 async def on_choose_type(action: cl.Action):
     try:
+        if cl.user_session.get("step") != "system_type":
+            return
         system_type = action.payload.get("value")
 
         if system_type == "Others":
@@ -738,6 +782,9 @@ async def on_choose_type(action: cl.Action):
         cl.user_session.set("system_type", system_type)
         questions = await cl.make_async(load_questions_from_DB)(system_type)
         cl.user_session.set("questions", questions)
+        if cl.user_session.get("document_text"):
+            await apply_document_answers()
+            return
         cl.user_session.set("step", "choose_method")
 
         file_path = "Obiettivi AI - Target Systems.xlsx"
@@ -841,6 +888,178 @@ async def on_choose_method(action: cl.Action):
         ).send()
 
 
+def language_actions():
+    return [
+        cl.Action(name="choose_language", payload={"value": LANG_IT}, label="Italiano"),
+        cl.Action(name="choose_language", payload={"value": LANG_EN}, label="English"),
+    ]
+
+
+def system_type_actions():
+    return [
+        cl.Action(name="choose_type", payload={"value": "Others"}, label="Others"),
+        cl.Action(name="choose_type", payload={"value": "AD-Azure"}, label="AD-Azure"),
+        cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
+        cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP"),
+    ]
+
+
+async def continue_after_document_analysis():
+    """Advance to the first setup field that the document could not provide."""
+    if not cl.user_session.get("lang_code"):
+        cl.user_session.set("step", "language")
+        await cl.Message(
+            content="Non riesco a determinare con sicurezza la lingua. Selezionala / "
+                    "I could not reliably determine the language. Please select it:",
+            actions=language_actions(),
+        ).send()
+        return
+
+    if not cl.user_session.get("company"):
+        cl.user_session.set("step", "company")
+        await cl.Message(content=t(
+            "Qual è il **nome della company**?",
+            "What is the **Company Name**?",
+        )).send()
+        return
+
+    if not cl.user_session.get("system"):
+        cl.user_session.set("step", "system")
+        await cl.Message(content=t(
+            "Qual è il **nome del Target System** che stiamo integrando?",
+            "What is the **Name of the Target System** we are integrating?",
+        )).send()
+        return
+
+    if not cl.user_session.get("system_type"):
+        cl.user_session.set("step", "system_type")
+        await cl.Message(
+            content=t(
+                "Il documento non permette di determinare con sicurezza il **tipo di target system**. Selezionalo:",
+                "The document does not reliably identify the **target system type**. Please select it:",
+            ),
+            actions=system_type_actions(),
+        ).send()
+        return
+
+
+    questions = cl.user_session.get("questions") or []
+    if not questions:
+        questions = await cl.make_async(load_questions_from_DB)(cl.user_session.get("system_type"))
+        cl.user_session.set("questions", questions)
+    await apply_document_answers()
+
+
+async def process_document_upload(file):
+    """Read a document, infer setup context, then answer the active questionnaire."""
+    try:
+        new_text = await cl.make_async(read_document)(file.path, file.name)
+        previous_text = cl.user_session.get("document_text") or ""
+        combined_text = (
+            f"{previous_text}\n\n--- {file.name} ---\n{new_text}"
+            if previous_text else new_text
+        )
+        if len(combined_text) > MAX_CHARS:
+            raise ValueError(
+                "The combined documents exceed 120,000 text characters. "
+                "Start a new conversation or upload shorter documents."
+            )
+    except Exception as exc:
+        await cl.Message(content=t(
+            f"Impossibile leggere il documento: {exc}",
+            f"Could not read the document: {exc}",
+        )).send()
+        return
+
+    # Retain the document even if context extraction fails: it may still answer
+    # the questionnaire once a type is chosen manually.
+    cl.user_session.set("document_text", combined_text)
+    names = cl.user_session.get("document_names") or []
+    cl.user_session.set("document_names", names + [file.name])
+
+    context = {}
+    try:
+        async with cl.Step(name=step_name("document_context")):
+            context, context_evidence = await cl.make_async(understand_document_context)(
+                combined_text, call_azure_llm
+            )
+        stored_evidence = cl.user_session.get("document_context_evidence") or {}
+        cl.user_session.set("document_context_evidence", {**stored_evidence, **context_evidence})
+    except Exception as exc:
+        await cl.Message(content=t(
+            f"Il documento è stato acquisito, ma l'analisi dei dati iniziali non è riuscita: {exc}",
+            f"The document was received, but its initial context could not be analyzed: {exc}",
+        )).send()
+
+    # Values explicitly entered or selected by the user always take precedence.
+    if not cl.user_session.get("lang_code") and context.get("language"):
+        set_language(context["language"])
+    if not cl.user_session.get("company") and context.get("company"):
+        cl.user_session.set("company", context["company"])
+    if not cl.user_session.get("system") and context.get("target_system"):
+        cl.user_session.set("system", context["target_system"])
+    if not cl.user_session.get("system_type") and context.get("system_type"):
+        cl.user_session.set("system_type", context["system_type"])
+
+    detected = []
+    labels = {
+        "language": t("Lingua", "Language"),
+        "company": t("Company", "Company"),
+        "target_system": t("Target system", "Target system"),
+        "system_type": t("Tipo", "Type"),
+    }
+    for field in ("language", "company", "target_system", "system_type"):
+        if context.get(field):
+            value = {"it": "Italiano", "en": "English"}.get(context[field], context[field])
+            detected.append(f"- **{labels[field]}:** {value}")
+    summary = t(
+        f"✅ Documento **{file.name}** analizzato.",
+        f"✅ Document **{file.name}** analyzed.",
+    )
+    if detected:
+        summary += "\n\n" + "\n".join(detected)
+    await cl.Message(content=summary).send()
+    await continue_after_document_analysis()
+
+
+async def apply_document_answers():
+    questions = cl.user_session.get("questions") or []
+    if not questions:
+        await cl.Message(content=t("Nessuna domanda disponibile per questo sistema.", "No questionnaire is available for this system.")).send()
+        return
+    try:
+        async with cl.Step(name=step_name("document_answers")):
+            complete, partial, evidence = await cl.make_async(understand_document)(
+                cl.user_session.get("document_text"), questions, call_azure_llm
+            )
+    except Exception as exc:
+        await cl.Message(content=t(
+            f"Analisi del documento non riuscita: {exc}. Puoi ricaricarlo o continuare in chat.",
+            f"Document analysis failed: {exc}. You can upload it again or continue in chat."
+        )).send()
+        cl.user_session.set("step", "conversational_chat")
+        await ask_next_question()
+        return
+    answers = cl.user_session.get("answers") or {}
+    # Explicit conversational answers take precedence over imported facts.
+    imported = {}
+    for question, answer in complete.items():
+        if question not in answers:
+            answers[question] = answer
+            imported[question] = answer
+    cl.user_session.set("answers", answers)
+    cl.user_session.set("document_partial", {q: v for q, v in partial.items() if q not in answers})
+    cl.user_session.set("document_evidence", evidence)
+    cl.user_session.set("step", "conversational_chat")
+    await cl.Message(content=t(
+        f"Risposte dal documento: {len(imported)} nuove risposte complete, {len(partial)} parziali. Proseguiamo con i dettagli mancanti.",
+        f"Answers from the document: {len(imported)} new complete answers, {len(partial)} partial answers. We will continue with the missing details."
+    )).send()
+    if imported:
+        await cl.Message(content="\n\n".join(f"**{q}**\n{a}" for q, a in imported.items())).send()
+    await ask_next_question()
+
+
 # ==========================================
 # FUNCTION: Asks the next question dynamically
 # ==========================================
@@ -932,6 +1151,11 @@ You are a Senior Technical Consultant conducting a formal IAM integration assess
 
 PREVIOUS CONTEXT / LAST USER MESSAGE:
 "{last_user_input if last_user_input else 'None. Start of the technical interview.'}"
+
+DOCUMENT FACTS FOR INCOMPLETE ANSWERS:
+{json.dumps(cl.user_session.get("document_partial") or {}, ensure_ascii=False)}
+Ask only for missing details when partial document facts exist. Do not ask the user
+for facts already provided in the document. Keep the original selected question index.
 
 REMAINING QUESTIONS TO ASK (Numbered Dictionary):
 {json.dumps(numbered_pending, ensure_ascii=False, indent=2)}
