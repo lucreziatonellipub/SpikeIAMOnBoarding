@@ -616,7 +616,8 @@ REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
     "status": "clarification" | "invalid" | "success",
     "message": "Response for the user in the selected language",
     "extracted_data": {{
-        "EXACT question text from REMAINING QUESTIONS TO BE SATISFIED or ALREADY ANSWERED QUESTIONS": "Extracted, cleaned, and summarized answer in the user's original typed language",
+        "question": "EXACT question text from REMAINING QUESTIONS TO BE SATISFIED or ALREADY ANSWERED QUESTIONS",
+        "answer": "Extracted, cleaned, and summarized answer in the user's original typed language",
         "other_infos": [
                 "Additional useful information in the user's original typed language"
         ]
@@ -625,7 +626,7 @@ REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
 
 RULES:
 - "extracted_data" must be populated only when "status" is "success". Otherwise, return an empty object.
-- "other_infos" must always be present. Return an empty array when there is no additional useful information."""
+- "other_infos" must always be present inside extracted_data. Return an empty array when there is no additional useful information."""
 
             analysis_str = await cl.make_async(call_azure_llm)(
                 user_message=message.content,
@@ -641,18 +642,6 @@ RULES:
             response_message = analysis.get("message", t("Errore di comprensione.", "Comprehension error."))
             extracted_data = analysis.get("extracted_data", {})
 
-            # Safe extraction/normalization for other_infos (must be a list)
-            other_infos = analysis.get("other_infos", [])
-            if other_infos is None:
-                other_infos = []
-            elif isinstance(other_infos, list):
-                pass
-            elif isinstance(other_infos, str):
-                other_infos = [other_infos] if other_infos.strip() else []
-            else:
-                # Any other single non-null value becomes a one-item list
-                other_infos = [other_infos]
-
             # Readable log (preserve Unicode)
             print(
                 "\n--- LOG ORCHESTRATOR PARSED ---\n"
@@ -661,7 +650,6 @@ RULES:
                         "status": status,
                         "message": response_message,
                         "extracted_data": extracted_data,
-                        "other_infos": other_infos,
                     },
                     ensure_ascii=False,
                     indent=2,
