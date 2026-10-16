@@ -3,8 +3,12 @@ from document_agent import MAX_CHARS, read_document, understand_document, unders
 import requests
 import pandas as pd
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import urllib3
 import os
+import time
+from pathlib import Path
 from dotenv import load_dotenv
 from database import get_db
 from models import Question, OnboardingSession
@@ -18,6 +22,33 @@ from functools import partial
 from auth import verify_password, load_users
 
 load_dotenv()
+
+LOG_LEVEL_NAME = os.getenv("ONBOARDING_LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+LOGGER = logging.getLogger("onboarding")
+LOGGER.setLevel(LOG_LEVEL)
+logging.getLogger("onboarding.document").setLevel(LOG_LEVEL)
+LOG_DIRECTORY = Path(__file__).resolve().parent / "logs"
+LOG_DIRECTORY.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIRECTORY / "onboarding.log"
+if not any(
+    isinstance(handler, RotatingFileHandler)
+    and Path(getattr(handler, "baseFilename", "")).resolve() == LOG_FILE.resolve()
+    for handler in LOGGER.handlers
+):
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setLevel(LOG_LEVEL)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    ))
+    LOGGER.addHandler(file_handler)
+LOGGER.info("LOGGING_READY level=%s file=%s", LOG_LEVEL_NAME, LOG_FILE)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -71,6 +102,46 @@ def user_lang_instruction() -> str:
         "BINDING INSTRUCTION: respond EXCLUSIVELY in English, regardless of the language typed by the user."
     )
 
+
+def normalize_orchestrator_answers(extracted_data, question_catalog, questions, other_infos=None):
+    """Accept the current ID schema and legacy response shapes without losing answers."""
+    mapped = {}
+    collected_other_infos = list(other_infos) if isinstance(other_infos, list) else []
+
+    def add_answer(question, answer):
+        if question in questions and isinstance(answer, str) and answer.strip():
+            mapped[question] = answer.strip()
+
+    if isinstance(extracted_data, list):
+        for item in extracted_data:
+            if not isinstance(item, dict):
+                continue
+            question = question_catalog.get(str(item.get("question_id")))
+            if question is None and isinstance(item.get("question"), str):
+                question = item["question"].strip()
+            add_answer(question, item.get("answer"))
+
+    elif isinstance(extracted_data, dict):
+        nested_other_infos = extracted_data.get("other_infos")
+        if isinstance(nested_other_infos, list):
+            collected_other_infos.extend(nested_other_infos)
+
+        # Legacy shape: {"question": "exact question", "answer": "value"}
+        if "question" in extracted_data and "answer" in extracted_data:
+            add_answer(extracted_data.get("question"), extracted_data.get("answer"))
+
+        # Earlier expected shape: {"exact question": "answer"}
+        for question, answer in extracted_data.items():
+            if isinstance(answer, dict):
+                answer = answer.get("answer")
+            add_answer(question, answer)
+
+    collected_other_infos = [
+        item.strip() for item in collected_other_infos
+        if isinstance(item, str) and item.strip()
+    ]
+    return mapped, list(dict.fromkeys(collected_other_infos))
+
 # ==========================================
 # SECTION 1: Azure OpenAI Configuration
 # ==========================================
@@ -78,8 +149,11 @@ def user_lang_instruction() -> str:
 def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool = False) -> str:
     azure_url = "https://spikeiam-genai-resource.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
     api_key = os.getenv("AZURE_API_KEY")
+    model = os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4-mini")
+    request_id = os.urandom(4).hex()
 
     if not api_key:
+        LOGGER.error("LLM_REQUEST_FAILED id=%s reason=missing_api_key", request_id)
         return '{"status": "error", "message": "Error: Missing AZURE_API_KEY"}'
 
     headers = {
@@ -92,21 +166,37 @@ def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool =
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        "model": "gpt-5.4-mini"
+        "model": model
     }
 
     if json_mode:
         payload["text"] = {"format": {"type": "json_object"}}
 
+    prompt_label = next((line.strip() for line in system_prompt.splitlines() if line.strip()), "")
+    LOGGER.info(
+        "LLM_REQUEST_START id=%s model=%s json_mode=%s system_chars=%d user_chars=%d prompt=%r",
+        request_id, model, json_mode, len(system_prompt), len(user_message), prompt_label[:160],
+    )
+    started_at = time.monotonic()
     try:
         response = requests.post(azure_url, headers=headers, json=payload, verify=False)
         response.raise_for_status()
-        return response.json()["output"][0]["content"][0]["text"]
+        output = response.json()["output"][0]["content"][0]["text"]
+        LOGGER.info(
+            "LLM_REQUEST_OK id=%s status=%s elapsed_seconds=%.2f output_chars=%d",
+            request_id, response.status_code, time.monotonic() - started_at, len(output),
+        )
+        LOGGER.debug("LLM_RESPONSE id=%s\n%s", request_id, output)
+        return output
 
     except Exception as e:
         error_details = str(e)
         if 'response' in locals() and response.text:
             error_details += f" | Response: {response.text}"
+        LOGGER.exception(
+            "LLM_REQUEST_FAILED id=%s elapsed_seconds=%.2f details=%s",
+            request_id, time.monotonic() - started_at, error_details,
+        )
         return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
 
 
@@ -131,6 +221,7 @@ def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
 # SECTION 3: Dynamic DB Reading
 # ==========================================
 def load_questions_from_DB(system_type: str) -> list:
+    db = None
     try:
         db = SessionLocal()
 
@@ -140,16 +231,27 @@ def load_questions_from_DB(system_type: str) -> list:
         for r in questions_db:
             questions.append(r.question)
 
-        db.close()
-
+        LOGGER.info("QUESTION_LOAD_OK system_type=%r count=%d", system_type, len(questions))
+        for index, question in enumerate(questions):
+            LOGGER.info("QUESTION_LOADED system_type=%r id=%d text=%r", system_type, index, question)
+        if not questions:
+            LOGGER.warning("QUESTION_LOAD_EMPTY system_type=%r", system_type)
         return questions
     except Exception as e:
-        print(f"Error connecting/reading DB: {e}")
-        return [
+        LOGGER.exception("QUESTION_LOAD_FAILED system_type=%r error=%s", system_type, e)
+        fallback_questions = [
             "Is the target system exposed to the internet or only available on the intranet?",
             "What authentication protocol does it use?",
             "Is there a test environment separated from the production one?"
         ]
+        LOGGER.warning(
+            "QUESTION_LOAD_FALLBACK system_type=%r count=%d questions=%r",
+            system_type, len(fallback_questions), fallback_questions,
+        )
+        return fallback_questions
+    finally:
+        if db is not None:
+            db.close()
 
 
 # ==========================================
@@ -229,6 +331,7 @@ async def start():
     cl.user_session.set("document_partial", {})
     cl.user_session.set("document_evidence", {})
     cl.user_session.set("answers", {})
+    cl.user_session.set("other_infos", [])
     cl.user_session.set("step", "language")
     cl.user_session.set("lang_code", None)
     cl.user_session.set("lang_name", None)
@@ -600,6 +703,9 @@ Reply ONLY with valid JSON:
         questions = cl.user_session.get("questions") or []
         current_question = cl.user_session.get("current_asked_question")
         pending_questions = [q for q in questions if q not in answers or not answers[q]]
+        pending_catalog = {f"P{index}": question for index, question in enumerate(pending_questions)}
+        answered_catalog = {f"A{index}": question for index, question in enumerate(answers)}
+        question_catalog = {**pending_catalog, **answered_catalog}
 
         if not pending_questions and not message.content:
             return
@@ -615,10 +721,10 @@ CURRENT QUESTION ASKED TO THE USER: "{current_question}"
 DOCUMENT FACTS FOR INCOMPLETE ANSWERS (combine with the user response; do not discard these facts):
 {json.dumps(cl.user_session.get("document_partial") or {}, ensure_ascii=False)}
 
-REMAINING QUESTIONS TO BE SATISFIED:
-{json.dumps(pending_questions, ensure_ascii=False)}
+QUESTION CATALOG (use these IDs in extracted_data):
+{json.dumps({question_id: {"question": question, "state": "pending" if question_id.startswith("P") else "answered"} for question_id, question in question_catalog.items()}, ensure_ascii=False)}
 
-ALREADY ANSWERED QUESTIONS (Current State):
+ALREADY ANSWERED VALUES:
 {json.dumps(answers, ensure_ascii=False)}
 
 ANALYZE THE USER'S MESSAGE AND CHOOSE ONE OF 3 ACTIONS:
@@ -632,13 +738,13 @@ ANALYZE THE USER'S MESSAGE AND CHOOSE ONE OF 3 ACTIONS:
 3. "success": The user provides a valid answer and/or corrects a previously provided answer.
    - Extract the answer.
    - CRITICAL LANGUAGE RULE: Keep the extracted answer in the EXACT SAME LANGUAGE used by the user. Do not translate it.
-   - Map the new information to every relevant question in "REMAINING QUESTIONS TO BE SATISFIED".
-   - CORRECTION RULE: If the user explicitly corrects or updates previously provided information, map the updated data to the exact question string found in "ALREADY ANSWERED QUESTIONS".
+   - Map the new information to every relevant question ID in QUESTION CATALOG.
+   - Use IDs beginning with P for pending questions and IDs beginning with A only for explicit corrections.
    - Use "message" to provide brief success feedback in the selected language.
 
 OTHER INFORMATION EXTRACTION:
-- Extract additional useful information provided by the user that does not directly answer any question in "REMAINING QUESTIONS TO BE SATISFIED" or update any question in "ALREADY ANSWERED QUESTIONS".
-- Store this information in "other_infos".
+- Extract additional useful information that does not answer or update any question in QUESTION CATALOG.
+- Store this information in the top-level "other_infos" array.
 - Keep each item in the EXACT SAME LANGUAGE used by the user. Do not translate it.
 - Clean and summarize each item without changing its meaning.
 - Do not duplicate information already stored in "extracted_data".
@@ -651,24 +757,25 @@ REPLY ONLY AND EXCLUSIVELY WITH THIS JSON:
 {{
     "status": "clarification" | "invalid" | "success",
     "message": "Response for the user in the selected language",
-    "extracted_data": {{
-        "question": "EXACT question text from REMAINING QUESTIONS TO BE SATISFIED or ALREADY ANSWERED QUESTIONS",
-        "answer": "Extracted, cleaned, and summarized answer in the user's original typed language",
-        "other_infos": [
-                "Additional useful information in the user's original typed language"
-        ]
-    }}
+    "extracted_data": [
+        {{
+            "question_id": "Exact ID from QUESTION CATALOG, such as P0 or A1",
+            "answer": "Extracted, cleaned answer in the user's original typed language"
+        }}
+    ],
+    "other_infos": ["Additional useful information in the user's original typed language"]
 }}
 
 RULES:
-- "extracted_data" must be populated only when "status" is "success". Otherwise, return an empty object.
-- "other_infos" must always be present inside extracted_data. Return an empty array when there is no additional useful information."""
+- "extracted_data" must be populated only when "status" is "success". Otherwise, return an empty array.
+- Never invent or alter a question_id.
+- "other_infos" must always be present at the top level. Return an empty array when there is no additional useful information."""
 
             analysis_str = await cl.make_async(call_azure_llm)(
                 user_message=message.content,
                 system_prompt=system_prompt_orchestrator
             )
-            print(f"\n--- DEBUG RISPOSTA API ---\n{analysis_str}\n--------------------------\n")
+            LOGGER.info("ORCHESTRATOR_MODEL_OUTPUT current_question=%r raw=%s", current_question, analysis_str)
 
         try:
             clean_json = analysis_str.replace("```json", "").replace("```", "").strip()
@@ -677,20 +784,16 @@ RULES:
             status = analysis.get("status", "error")
             response_message = analysis.get("message", t("Errore di comprensione.", "Comprehension error."))
             extracted_data = analysis.get("extracted_data", {})
-
-            # Readable log (preserve Unicode)
-            print(
-                "\n--- LOG ORCHESTRATOR PARSED ---\n"
-                + json.dumps(
-                    {
-                        "status": status,
-                        "message": response_message,
-                        "extracted_data": extracted_data,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n------------------------------\n"
+            mapped_answers, other_infos = normalize_orchestrator_answers(
+                extracted_data,
+                question_catalog,
+                questions,
+                analysis.get("other_infos"),
+            )
+            LOGGER.info(
+                "ORCHESTRATOR_RESULT status=%r current_question=%r raw_extracted=%r "
+                "mapped_answers=%r other_infos=%r",
+                status, current_question, extracted_data, mapped_answers, other_infos,
             )
 
             if status in ("clarification", "invalid"):
@@ -701,21 +804,46 @@ RULES:
                 )).send()
 
             elif status == "success":
-                for q, a in extracted_data.items():
-                    if q in questions:
-                        if q in answers:
-                            await cl.Message(content=t(
-                                f"🔄 *Requisito aggiornato:* **{q}** \n> {a}",
-                                f"🔄 *Updated requirement:* **{q}** \n> {a}"
-                            )).send()
-                        else:
-                            await cl.Message(content=t(
-                                f"✅ *Requisito salvato:* **{q}** \n> {a}",
-                                f"✅ *Saved requirement:* **{q}** \n> {a}"
-                            )).send()
-                        answers[q] = a
+                # A model may still return an older/malformed mapping. If it
+                # judged the reply successful, save it against the question
+                # that was actually shown so the interview cannot loop forever.
+                if not mapped_answers and current_question in pending_questions and message.content.strip():
+                    mapped_answers[current_question] = message.content.strip()
+                    LOGGER.warning(
+                        "ORCHESTRATOR_FALLBACK_CURRENT_QUESTION question=%r answer=%r",
+                        current_question, message.content.strip(),
+                    )
+
+                if not mapped_answers:
+                    LOGGER.error(
+                        "ORCHESTRATOR_SUCCESS_WITHOUT_ANSWERS current_question=%r raw=%r",
+                        current_question, extracted_data,
+                    )
+                    await cl.Message(content=t(
+                        "⚠️ Non sono riuscito ad associare la risposta alla domanda corrente. Riprova specificando direttamente il dato richiesto.",
+                        "⚠️ I could not associate the answer with the current question. Please retry with the requested information directly."
+                    )).send()
+                    return
+
+                partial_facts = cl.user_session.get("document_partial") or {}
+                for q, a in mapped_answers.items():
+                    if q in answers:
+                        await cl.Message(content=t(
+                            f"🔄 *Requisito aggiornato:* **{q}** \n> {a}",
+                            f"🔄 *Updated requirement:* **{q}** \n> {a}"
+                        )).send()
+                    else:
+                        await cl.Message(content=t(
+                            f"✅ *Requisito salvato:* **{q}** \n> {a}",
+                            f"✅ *Saved requirement:* **{q}** \n> {a}"
+                        )).send()
+                    answers[q] = a
+                    partial_facts.pop(q, None)
 
                 cl.user_session.set("answers", answers)
+                cl.user_session.set("document_partial", partial_facts)
+                stored_other_infos = cl.user_session.get("other_infos") or []
+                cl.user_session.set("other_infos", list(dict.fromkeys(stored_other_infos + other_infos)))
                 await cl.Message(content=response_message).send()
                 await ask_next_question(last_user_input=message.content)
 
@@ -726,6 +854,7 @@ RULES:
                 )).send()
 
         except json.JSONDecodeError:
+            LOGGER.exception("ORCHESTRATOR_INVALID_JSON raw=%r", analysis_str)
             await cl.Message(content=t(
                 "⚠️ *Il server ha risposto in un formato inatteso. Riprova.*",
                 "⚠️ *The server responded in an unexpected format. Please try again.*"
@@ -952,6 +1081,12 @@ async def continue_after_document_analysis():
 
 async def process_document_upload(file):
     """Read a document, infer setup context, then answer the active questionnaire."""
+    LOGGER.info(
+        "DOCUMENT_UPLOAD_START name=%r step=%r language=%r company=%r system=%r system_type=%r",
+        file.name, cl.user_session.get("step"), cl.user_session.get("lang_code"),
+        cl.user_session.get("company"), cl.user_session.get("system"),
+        cl.user_session.get("system_type"),
+    )
     try:
         new_text = await cl.make_async(read_document)(file.path, file.name)
         previous_text = cl.user_session.get("document_text") or ""
@@ -964,7 +1099,12 @@ async def process_document_upload(file):
                 "The combined documents exceed 120,000 text characters. "
                 "Start a new conversation or upload shorter documents."
             )
+        LOGGER.info(
+            "DOCUMENT_UPLOAD_TEXT_READY name=%r new_chars=%d previous_chars=%d combined_chars=%d",
+            file.name, len(new_text), len(previous_text), len(combined_text),
+        )
     except Exception as exc:
+        LOGGER.exception("DOCUMENT_UPLOAD_READ_FAILED name=%r error=%s", file.name, exc)
         await cl.Message(content=t(
             f"Impossibile leggere il documento: {exc}",
             f"Could not read the document: {exc}",
@@ -986,6 +1126,7 @@ async def process_document_upload(file):
         stored_evidence = cl.user_session.get("document_context_evidence") or {}
         cl.user_session.set("document_context_evidence", {**stored_evidence, **context_evidence})
     except Exception as exc:
+        LOGGER.exception("DOCUMENT_UPLOAD_CONTEXT_FAILED name=%r error=%s", file.name, exc)
         await cl.Message(content=t(
             f"Il documento è stato acquisito, ma l'analisi dei dati iniziali non è riuscita: {exc}",
             f"The document was received, but its initial context could not be analyzed: {exc}",
@@ -1000,6 +1141,13 @@ async def process_document_upload(file):
         cl.user_session.set("system", context["target_system"])
     if not cl.user_session.get("system_type") and context.get("system_type"):
         cl.user_session.set("system_type", context["system_type"])
+
+    LOGGER.info(
+        "DOCUMENT_UPLOAD_CONTEXT_APPLIED name=%r extracted=%s session_language=%r "
+        "session_company=%r session_system=%r session_system_type=%r",
+        file.name, context, cl.user_session.get("lang_code"), cl.user_session.get("company"),
+        cl.user_session.get("system"), cl.user_session.get("system_type"),
+    )
 
     detected = []
     labels = {
@@ -1024,15 +1172,23 @@ async def process_document_upload(file):
 
 async def apply_document_answers():
     questions = cl.user_session.get("questions") or []
+    document_text = cl.user_session.get("document_text") or ""
+    LOGGER.info(
+        "DOCUMENT_ANSWERS_START system_type=%r questions=%d document_chars=%d existing_answers=%d",
+        cl.user_session.get("system_type"), len(questions), len(document_text),
+        len(cl.user_session.get("answers") or {}),
+    )
     if not questions:
+        LOGGER.error("DOCUMENT_ANSWERS_ABORT reason=no_questions system_type=%r", cl.user_session.get("system_type"))
         await cl.Message(content=t("Nessuna domanda disponibile per questo sistema.", "No questionnaire is available for this system.")).send()
         return
     try:
         async with cl.Step(name=step_name("document_answers")):
             complete, partial, evidence = await cl.make_async(understand_document)(
-                cl.user_session.get("document_text"), questions, call_azure_llm
+                document_text, questions, call_azure_llm
             )
     except Exception as exc:
+        LOGGER.exception("DOCUMENT_ANSWERS_FAILED error=%s", exc)
         await cl.Message(content=t(
             f"Analisi del documento non riuscita: {exc}. Puoi ricaricarlo o continuare in chat.",
             f"Document analysis failed: {exc}. You can upload it again or continue in chat."
@@ -1048,13 +1204,31 @@ async def apply_document_answers():
             answers[question] = answer
             imported[question] = answer
     cl.user_session.set("answers", answers)
-    cl.user_session.set("document_partial", {q: v for q, v in partial.items() if q not in answers})
+    active_partial = {q: v for q, v in partial.items() if q not in answers}
+    cl.user_session.set("document_partial", active_partial)
     cl.user_session.set("document_evidence", evidence)
     cl.user_session.set("step", "conversational_chat")
-    await cl.Message(content=t(
-        f"Risposte dal documento: {len(imported)} nuove risposte complete, {len(partial)} parziali. Proseguiamo con i dettagli mancanti.",
-        f"Answers from the document: {len(imported)} new complete answers, {len(partial)} partial answers. We will continue with the missing details."
-    )).send()
+    LOGGER.info(
+        "DOCUMENT_ANSWERS_RESULT extracted_complete=%d imported_new=%d partial=%d "
+        "total_answers=%d still_missing=%d",
+        len(complete), len(imported), len(active_partial), len(answers),
+        len([question for question in questions if not answers.get(question)]),
+    )
+    for question, value in active_partial.items():
+        LOGGER.info(
+            "DOCUMENT_ANSWER_PARTIAL question=%r answer=%r missing=%r",
+            question, value.get("answer"), value.get("missing"),
+        )
+    if not complete and not active_partial:
+        await cl.Message(content=t(
+            f"⚠️ Il documento è stato letto ({len(document_text)} caratteri), ma non è stato possibile associare informazioni alle {len(questions)} domande del questionario. I dettagli diagnostici sono disponibili nel terminale. Proseguiamo con le domande mancanti.",
+            f"⚠️ The document was read ({len(document_text)} characters), but no information could be mapped to the {len(questions)} questionnaire questions. Diagnostic details are available in the terminal. We will continue with the missing questions."
+        )).send()
+    else:
+        await cl.Message(content=t(
+            f"Risposte dal documento: {len(imported)} nuove risposte complete, {len(active_partial)} parziali. Proseguiamo con i dettagli mancanti.",
+            f"Answers from the document: {len(imported)} new complete answers, {len(active_partial)} partial answers. We will continue with the missing details."
+        )).send()
     if imported:
         await cl.Message(content="\n\n".join(f"**{q}**\n{a}" for q, a in imported.items())).send()
     await ask_next_question()
@@ -1072,6 +1246,11 @@ async def ask_next_question(last_user_input: str = ""):
     answers = cl.user_session.get("answers") or {}
 
     pending_questions = [q for q in questions if q not in answers or not answers[q]]
+    LOGGER.info(
+        "QUESTION_PROGRESS total=%d answered=%d pending=%d current=%r",
+        len(questions), len(questions) - len(pending_questions), len(pending_questions),
+        cl.user_session.get("current_asked_question"),
+    )
 
     # --- END: Translation and DB save ---
     if not pending_questions:

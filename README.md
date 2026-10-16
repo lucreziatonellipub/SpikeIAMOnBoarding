@@ -127,3 +127,17 @@ Complete answers are displayed and included in the existing database save and tr
 Several documents can be supplied during the same conversation, one file per upload. Their contents are combined so later files can complete earlier answers. Limits: 20 MB per file and 120,000 extracted characters across the conversation; UTF-8 text files. PDFs must contain selectable text (OCR is not included). Documents exceeding the limits are rejected rather than silently truncated. In the dedicated completed-Excel step, an XLSX upload is treated as the questionnaire template; other uploads are treated as source documents. Install the updated requirements to enable PDF extraction.
 
 Run document tests with `python -m unittest discover -s tests`. Live agent output requires configured Azure credentials and the questionnaire database.
+
+### Document diagnostics
+
+Document processing writes structured diagnostics both to the application terminal and to the rotating `logs/onboarding.log` file. At the default `INFO` level the log includes the file type and size, extracted character count and preview, selected target type, questions loaded from the database, model output, accepted or rejected mappings, and every unanswered question. Each file is limited to 5 MB and the three previous files are retained.
+
+For a full diagnostic run in PowerShell:
+
+```powershell
+$env:ONBOARDING_LOG_LEVEL="DEBUG"
+$env:ONBOARDING_LOG_DOCUMENT_TEXT="1"
+chainlit run app.py -w
+```
+
+`ONBOARDING_LOG_DOCUMENT_TEXT=1` prints the complete extracted document at `DEBUG` level. Leave it disabled to print only the first 1,000 characters. The main events to inspect are `DOCUMENT_READ_OK`, `DOCUMENT_UPLOAD_CONTEXT_APPLIED`, `QUESTION_LOAD_OK`, `DOCUMENT_MAPPING_MODEL_OUTPUT`, `DOCUMENT_MAPPING_ACCEPT`, `DOCUMENT_MAPPING_REJECT`, `DOCUMENT_MAPPING_MISSING`, `ORCHESTRATOR_RESULT`, and `ORCHESTRATOR_FALLBACK_CURRENT_QUESTION`.

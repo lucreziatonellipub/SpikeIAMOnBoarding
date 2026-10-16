@@ -7,6 +7,74 @@ from document_agent import read_document, understand_document, understand_docume
 
 
 class DocumentAgentTests(unittest.TestCase):
+    def test_answer_contains_only_facts_without_document_framing(self):
+        question = "Are there any exceptions or non-standard scenarios?"
+        source = (
+            "Validare porte definitive ed endpoint; eventuale uso di Global Catalog, "
+            "Kerberos, SMB, RPC, WinRM ed egress 443."
+        )
+        response = {"items": [{
+            "question_id": "0",
+            "answer": (
+                "Sì: il documento segnala come eccezioni o scenari non standard "
+                "la necessità di validare porte definitive ed endpoint; eventuale uso "
+                "di Global Catalog, Kerberos, SMB, RPC, WinRM ed egress 443. &#x20;"
+            ),
+            "status": "complete",
+            "evidence": source,
+            "missing": "",
+        }]}
+        complete, _, _ = understand_document(
+            source, [question], lambda **kwargs: json.dumps(response)
+        )
+        self.assertEqual(
+            complete[question],
+            "La necessità di validare porte definitive ed endpoint; eventuale uso "
+            "di Global Catalog, Kerberos, SMB, RPC, WinRM ed egress 443.",
+        )
+
+    def test_question_ids_map_answers_without_exact_question_echo(self):
+        response = {"items": [{
+            "question_id": "0",
+            "question": "A rephrased question that must be ignored",
+            "answer": "REST API",
+            "status": "complete",
+            "evidence": "Integration through REST API",
+            "missing": "",
+        }]}
+        complete, partial, evidence = understand_document(
+            "Integration through REST API",
+            ["Which integration interface is available?"],
+            lambda **kwargs: json.dumps(response),
+        )
+        self.assertEqual(complete, {"Which integration interface is available?": "REST API"})
+        self.assertEqual(partial, {})
+        self.assertIn("Which integration interface is available?", evidence)
+
+    def test_evidence_wrapped_in_quotes_is_still_grounded(self):
+        response = {"items": [{
+            "question_id": "0", "answer": "REST API", "status": "complete",
+            "evidence": '"The preferred interface is a REST API."', "missing": "",
+        }]}
+        complete, partial, _ = understand_document(
+            "The preferred interface is a REST API.", ["Which interface is preferred?"],
+            lambda **kwargs: json.dumps(response),
+        )
+        self.assertEqual(complete, {"Which interface is preferred?": "REST API"})
+        self.assertEqual(partial, {})
+
+    def test_multiple_evidence_excerpts_are_supported(self):
+        response = {"items": [{
+            "question_id": "0", "answer": "DEV and PROD are in scope",
+            "status": "complete", "evidence": ["DEV exists.", "PROD is in scope."],
+            "missing": "",
+        }]}
+        complete, _, _ = understand_document(
+            "DEV exists. Additional text. PROD is in scope.", ["Which environments are in scope?"],
+            lambda **kwargs: json.dumps(response),
+        )
+        self.assertIn("Which environments are in scope?", complete)
+
     def test_context_extracts_only_allowed_evidence_grounded_values(self):
         source = "Società: ACME. Sistema: People API. Integrazione via REST API."
         response = {

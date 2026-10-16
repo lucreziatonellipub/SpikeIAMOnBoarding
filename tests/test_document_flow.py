@@ -1,5 +1,6 @@
 """Exercise the actual app transition without database/API connections."""
 import ast
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -37,6 +38,7 @@ class DocumentFlowTests(IsolatedAsyncioTestCase):
         next_question = AsyncMock()
         namespace = {
             "cl": SimpleNamespace(user_session=session, Step=Step, Message=Message, make_async=make_async),
+            "LOGGER": logging.getLogger("test.document_flow"),
             "t": lambda it, en: en, "step_name": lambda key: key, "call_azure_llm": None,
             "understand_document": lambda *args: (
                 {"Protocol?": "LDAP"}, {"Environment?": {"answer": "Production", "missing": "Test"}},
@@ -85,6 +87,7 @@ class DocumentFlowTests(IsolatedAsyncioTestCase):
         apply_answers = AsyncMock()
         namespace = {
             "cl": SimpleNamespace(user_session=session, Step=Step, Message=Message, make_async=make_async),
+            "LOGGER": logging.getLogger("test.document_flow"),
             "t": lambda it, en: it if state.get("lang_code") == "it" else en,
             "step_name": lambda key: key,
             "read_document": lambda path, name: "Documento IAM",
