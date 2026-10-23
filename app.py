@@ -17,11 +17,44 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 import asyncio
-from functools import partial
+from functools import partial, wraps
+from contextlib import suppress
+
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+from sqlalchemy import (
+    Column,
+    MetaData,
+    String,
+    Table,
+    Text,
+    insert,
+    select,
+    update,
+)
 
 from auth import verify_password, load_users
 
 load_dotenv()
+
+@cl.data_layer
+def get_chainlit_data_layer():
+    conninfo = os.environ.get("CHAINLIT_DATABASE_URL", "").strip()
+
+    if not conninfo:
+        raise RuntimeError(
+            "CHAINLIT_DATABASE_URL non configurata. "
+            "Impostare la connessione PostgreSQL del data layer Chainlit."
+        )
+
+    if not conninfo.startswith("postgresql+asyncpg://"):
+        raise RuntimeError(
+            "CHAINLIT_DATABASE_URL deve iniziare con "
+            "'postgresql+asyncpg://'. "
+            "Il data layer Chainlit richiede un driver asincrono. "
+            "Non modificare la connessione sincrona di database.py."
+        )
+
+    return SQLAlchemyDataLayer(conninfo=conninfo)
 
 LOG_LEVEL_NAME = os.getenv("ONBOARDING_LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
@@ -82,13 +115,13 @@ def require_buttons_warning_language_step() -> str:
 def step_name(key: str) -> str:
     """Localized cl.Step visible names (best effort)."""
     names = {
-        "language": ( "Selezione lingua", "Language selection"),
-        "company": ( "Inserimento azienda", "Company input"),
-        "intent_analysis": ( "Analisi intento e dati", "Intent and Data Analysis"),
-        "identifying_target": ( "Identificazione tipo Target System", "Identifying Target System Type"),
-        "validation_excel": ( "Validazione risposte Excel", "Excel answers validation"),
-        "translate_save": ( "Elaborazione e traduzione dati", "Data processing & translation"),
-        "question_selection": ( "Selezione domanda contestuale", "Contextual Question Selection"),
+        "language": ("Selezione lingua", "Language selection"),
+        "company": ("Inserimento azienda", "Company input"),
+        "intent_analysis": ("Analisi intento e dati", "Intent and Data Analysis"),
+        "identifying_target": ("Identificazione tipo Target System", "Identifying Target System Type"),
+        "validation_excel": ("Validazione risposte Excel", "Excel answers validation"),
+        "translate_save": ("Elaborazione e traduzione dati", "Data processing & translation"),
+        "question_selection": ("Selezione domanda contestuale", "Contextual Question Selection"),
         "document_context": ("Analisi contesto documento", "Document context analysis"),
         "document_answers": ("Analisi risposte documento", "Document answers analysis"),
     }
@@ -101,7 +134,6 @@ def user_lang_instruction() -> str:
         "ISTRUZIONE VINCOLANTE: rispondi ESCLUSIVAMENTE in Italiano, indipendentemente dalla lingua digitata dall'utente.",
         "BINDING INSTRUCTION: respond EXCLUSIVELY in English, regardless of the language typed by the user."
     )
-
 
 def normalize_orchestrator_answers(extracted_data, question_catalog, questions, other_infos=None):
     """Accept the current ID schema and legacy response shapes without losing answers."""
@@ -179,7 +211,13 @@ def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool =
     )
     started_at = time.monotonic()
     try:
-        response = requests.post(azure_url, headers=headers, json=payload, verify=False)
+        response = requests.post(
+            azure_url,
+            headers=headers,
+            json=payload,
+            verify=False,
+            timeout=(10, 120),
+        )
         response.raise_for_status()
         output = response.json()["output"][0]["content"][0]["text"]
         LOGGER.info(
@@ -199,10 +237,10 @@ def call_azure_llm(user_message: str, system_prompt: str = "", json_mode: bool =
         )
         return json.dumps({"status": "error", "message": f"API Error: {error_details}"})
 
-
 # ==========================================
 # SECTION 2: Dynamic Excel Reading
 # ==========================================
+
 def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name)
@@ -216,10 +254,10 @@ def load_questions_from_excel(file_path: str, sheet_name: str) -> list:
             "Is there a test environment separated from the production one?"
         ]
 
-
 # ==========================================
 # SECTION 3: Dynamic DB Reading
 # ==========================================
+
 def load_questions_from_DB(system_type: str) -> list:
     db = None
     try:
@@ -253,10 +291,10 @@ def load_questions_from_DB(system_type: str) -> list:
         if db is not None:
             db.close()
 
-
 # ==========================================
 # SECTION 4: Auth
 # ==========================================
+
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):
     users = load_users()
@@ -282,10 +320,10 @@ def auth_callback(username: str, password: str):
         metadata={"role": "user", "provider": "credentials"}
     )
 
-
 # ==========================================
 # CONSTANTS: Prompts for "Others" identification flow (localized at runtime)
 # ==========================================
+
 def other_system_prompt_ask() -> str:
     return f"""{user_lang_instruction()}
 You are a Senior Technical Consultant conducting a formal IAM integration assessment.
@@ -319,11 +357,265 @@ Additionally, provide a confidence flag:
 Reply ONLY and EXCLUSIVELY with the two tokens separated by a single pipe character:
 "Target DB|CONFIDENT", "Target DB|NOT_CONFIDENT", "Generic|CONFIDENT", or "Generic|NOT_CONFIDENT"."""
 
+# ==========================================
+# SESSION CHECKPOINTS
+# ==========================================
+
+CHECKPOINT_KEYS = (
+    "document_text",
+    "document_names",
+    "document_context_evidence",
+    "document_partial",
+    "document_evidence",
+    "answers",
+    "other_infos",
+    "step",
+    "lang_code",
+    "lang_name",
+    "company",
+    "system",
+    "system_type",
+    "questions",
+    "current_asked_question",
+    "current_question_text",
+    "other_conversation",
+    "other_exchange_count",
+    "finalization_started",
+)
+
+checkpoint_metadata = MetaData()
+
+session_checkpoints = Table(
+    "onboarding_chat_checkpoint",
+    checkpoint_metadata,
+    Column("thread_id", String(255), primary_key=True),
+    Column("owner", String(255), nullable=False),
+    Column("state_json", Text, nullable=False),
+)
+
+# In produzione, creare questa tabella tramite la migrazione del progetto.
+checkpoint_metadata.create_all(
+    bind=engine,
+    tables=[session_checkpoints],
+)
+
+# Solo oggetti runtime: NON inserirli in cl.user_session.
+_session_runtime = {}
+
+def session_identity():
+    user = cl.user_session.get("user")
+    if user is None:
+        raise RuntimeError("Authenticated user required.")
+
+    return str(cl.context.session.thread_id), user.identifier
+
+def runtime_state():
+    session_id = cl.user_session.get("id")
+    return _session_runtime.setdefault(
+        session_id,
+        {"lock": asyncio.Lock(), "task": None},
+    )
+
+def snapshot_state():
+    # Copia profonda e verifica che lo stato sia serializzabile.
+    return json.loads(json.dumps(
+        {
+            key: cl.user_session.get(key)
+            for key in CHECKPOINT_KEYS
+        },
+        ensure_ascii=False,
+    ))
+
+def restore_state(state):
+    for key in CHECKPOINT_KEYS:
+        cl.user_session.set(key, state.get(key))
+
+def write_checkpoint(db, state):
+    """Scrive usando la transazione del chiamante."""
+    thread_id, owner = session_identity()
+
+    existing_owner = db.execute(
+        select(session_checkpoints.c.owner).where(
+            session_checkpoints.c.thread_id == thread_id
+        )
+    ).scalar_one_or_none()
+
+    payload = json.dumps(state, ensure_ascii=False)
+
+    if existing_owner is None:
+        db.execute(insert(session_checkpoints).values(
+            thread_id=thread_id,
+            owner=owner,
+            state_json=payload,
+        ))
+    else:
+        if existing_owner != owner:
+            raise PermissionError("Chat ownership mismatch.")
+
+        db.execute(
+            update(session_checkpoints)
+            .where(session_checkpoints.c.thread_id == thread_id)
+            .values(state_json=payload)
+        )
+
+def save_checkpoint():
+    with get_db() as db:
+        write_checkpoint(db, snapshot_state())
+        db.commit()
+
+def load_checkpoint(thread_id):
+    _, owner = session_identity()
+
+    with get_db() as db:
+        row = db.execute(
+            select(
+                session_checkpoints.c.owner,
+                session_checkpoints.c.state_json,
+            ).where(
+                session_checkpoints.c.thread_id == str(thread_id)
+            )
+        ).mappings().first()
+
+    if row is None:
+        return None
+
+    if row["owner"] != owner:
+        raise PermissionError("Chat ownership mismatch.")
+
+    return json.loads(row["state_json"])
+
+def checkpointed(handler):
+    """
+    Serializza gli eventi nella connessione corrente.
+
+    Un evento interrotto viene annullato tornando al checkpoint
+    precedente, salvo una finalizzazione già committata.
+    """
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        runtime = runtime_state()
+
+        async with runtime["lock"]:
+            before = snapshot_state()
+            runtime["task"] = asyncio.current_task()
+
+            try:
+                result = await handler(*args, **kwargs)
+                save_checkpoint()
+                return result
+
+            except asyncio.CancelledError:
+                if cl.user_session.get("step") != "completed":
+                    restore_state(before)
+
+                save_checkpoint()
+                raise
+
+            except Exception:
+                if cl.user_session.get("step") != "completed":
+                    restore_state(before)
+
+                save_checkpoint()
+                raise
+
+            finally:
+                runtime["task"] = None
+
+    return wrapped
+
+# ==========================================
+# SESSION-SPECIFIC EXCEL QUESTIONNAIRE
+# ==========================================
+
+def questionnaire_path():
+    thread_id, _ = session_identity()
+
+    # Impedisce di usare il thread ID direttamente come percorso.
+    from hashlib import sha256
+    directory_name = sha256(thread_id.encode("utf-8")).hexdigest()
+
+    directory = (
+        Path(__file__).resolve().parent
+        / "session_files"
+        / directory_name
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+
+    return str(directory / "Obiettivi AI - Target Systems.xlsx")
+
+def build_questionnaire():
+    from openpyxl import load_workbook
+
+    questions = cl.user_session.get("questions") or []
+    system_type = cl.user_session.get("system_type")
+    file_path = questionnaire_path()
+
+    df = pd.DataFrame({
+        "Question": questions,
+        "Answer": [""] * len(questions),
+    })
+
+    df.to_excel(
+        file_path,
+        index=False,
+        sheet_name=system_type[:31],
+        engine="openpyxl",
+    )
+
+    wb = load_workbook(file_path)
+    ws = wb.active
+
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(
+        start_color="4472C4",
+        end_color="4472C4",
+        fill_type="solid",
+    )
+    header_alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+        wrap_text=True,
+    )
+    cell_alignment = Alignment(vertical="top", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    alt_fill = PatternFill(
+        start_color="D9E2F3",
+        end_color="D9E2F3",
+        fill_type="solid",
+    )
+
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2),
+        start=2,
+    ):
+        for cell in row:
+            cell.alignment = cell_alignment
+            cell.border = thin_border
+            if row_idx % 2 == 0:
+                cell.fill = alt_fill
+
+    ws.column_dimensions[get_column_letter(1)].width = 60
+    ws.column_dimensions[get_column_letter(2)].width = 40
+    ws.freeze_panes = "A2"
+    wb.save(file_path)
 
 # ==========================================
 # SECTION 5: Initial Flow Management (Language -> Company -> System -> Type -> Method)
 # ==========================================
+
 @cl.on_chat_start
+@checkpointed
 async def start():
     cl.user_session.set("document_text", None)
     cl.user_session.set("document_names", [])
@@ -347,8 +639,8 @@ async def start():
         actions=actions
     ).send()
 
-
 @cl.on_message
+@checkpointed
 async def main(message: cl.Message):
     step = cl.user_session.get("step")
     answers = cl.user_session.get("answers") or {}
@@ -485,39 +777,7 @@ async def main(message: cl.Message):
                 return
             cl.user_session.set("step", "choose_method")
 
-            file_path = "Obiettivi AI - Target Systems.xlsx"
-            df = pd.DataFrame({"Question": questions, "Answer": [""] * len(questions)})
-
-            def build_excel():
-                from openpyxl import load_workbook
-
-                df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
-                wb = load_workbook(file_path)
-                ws = wb.active
-                header_font = Font(bold=True, color="FFFFFF", size=11)
-                header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-                header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                cell_alignment = Alignment(vertical="top", wrap_text=True)
-                thin_border = Border(left=Side(style="thin"), right=Side(style="thin"),
-                                     top=Side(style="thin"), bottom=Side(style="thin"))
-                alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
-                for cell in ws[1]:
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.alignment = header_alignment
-                    cell.border = thin_border
-                for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
-                    for cell in row:
-                        cell.alignment = cell_alignment
-                        cell.border = thin_border
-                        if row_idx % 2 == 0:
-                            cell.fill = alt_fill
-                ws.column_dimensions[get_column_letter(1)].width = 60
-                ws.column_dimensions[get_column_letter(2)].width = 40
-                ws.freeze_panes = "A2"
-                wb.save(file_path)
-
-            await cl.make_async(build_excel)()
+            await cl.make_async(build_questionnaire)()
 
             actions = [
                 cl.Action(name="choose_method", payload={"value": "chat"}, label=t("💬 Continua in chat", "💬 Continue in Chat")),
@@ -861,11 +1121,12 @@ RULES:
             )).send()
         return
 
-
 # ==========================================
 # CALLBACK: Language Selection
 # ==========================================
+
 @cl.action_callback("choose_language")
+@checkpointed
 async def on_choose_language(action: cl.Action):
     if cl.user_session.get("step") != "language":
         return
@@ -884,11 +1145,12 @@ async def on_choose_language(action: cl.Action):
         )
     ).send()
 
-
 # ==========================================
 # CALLBACK: Target Type Selection
 # ==========================================
+
 @cl.action_callback("choose_type")
+@checkpointed
 async def on_choose_type(action: cl.Action):
     try:
         if cl.user_session.get("step") != "system_type":
@@ -916,39 +1178,7 @@ async def on_choose_type(action: cl.Action):
             return
         cl.user_session.set("step", "choose_method")
 
-        file_path = "Obiettivi AI - Target Systems.xlsx"
-        df = pd.DataFrame({"Question": questions, "Answer": [""] * len(questions)})
-
-        def build_excel():
-            from openpyxl import load_workbook
-
-            df.to_excel(file_path, index=False, sheet_name=system_type[:31], engine="openpyxl")
-            wb = load_workbook(file_path)
-            ws = wb.active
-            header_font = Font(bold=True, color="FFFFFF", size=11)
-            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-            header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell_alignment = Alignment(vertical="top", wrap_text=True)
-            thin_border = Border(left=Side(style="thin"), right=Side(style="thin"),
-                                 top=Side(style="thin"), bottom=Side(style="thin"))
-            alt_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
-            for cell in ws[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.alignment = header_alignment
-                cell.border = thin_border
-            for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=2), start=2):
-                for cell in row:
-                    cell.alignment = cell_alignment
-                    cell.border = thin_border
-                    if row_idx % 2 == 0:
-                        cell.fill = alt_fill
-            ws.column_dimensions[get_column_letter(1)].width = 60
-            ws.column_dimensions[get_column_letter(2)].width = 40
-            ws.freeze_panes = "A2"
-            wb.save(file_path)
-
-        await cl.make_async(build_excel)()
+        await cl.make_async(build_questionnaire)()
 
         actions = [
             cl.Action(name="choose_method", payload={"value": "chat"}, label=t("💬 Continua in chat", "💬 Continue in Chat")),
@@ -969,11 +1199,12 @@ async def on_choose_type(action: cl.Action):
         )).send()
         raise
 
-
 # ==========================================
 # CALLBACK: Method Selection (Chat vs Excel)
 # ==========================================
+
 @cl.action_callback("choose_method")
+@checkpointed
 async def on_choose_method(action: cl.Action):
     step = cl.user_session.get("step")
     if step in ("finalizing", "completed"):
@@ -990,10 +1221,12 @@ async def on_choose_method(action: cl.Action):
     elif method == "excel":
         cl.user_session.set("step", "upload_excel")
 
+        await cl.make_async(build_questionnaire)()
+
         elements = [
             cl.File(
                 name="Obiettivi AI - Target Systems.xlsx",
-                path="Obiettivi AI - Target Systems.xlsx",
+                path=questionnaire_path(),
                 display="inline"
             )
         ]
@@ -1016,13 +1249,11 @@ async def on_choose_method(action: cl.Action):
             elements=elements
         ).send()
 
-
 def language_actions():
     return [
         cl.Action(name="choose_language", payload={"value": LANG_IT}, label="Italiano"),
         cl.Action(name="choose_language", payload={"value": LANG_EN}, label="English"),
     ]
-
 
 def system_type_actions():
     return [
@@ -1031,7 +1262,6 @@ def system_type_actions():
         cl.Action(name="choose_type", payload={"value": "SAP"}, label="SAP"),
         cl.Action(name="choose_type", payload={"value": "LDAP"}, label="LDAP"),
     ]
-
 
 async def continue_after_document_analysis():
     """Advance to the first setup field that the document could not provide."""
@@ -1071,13 +1301,11 @@ async def continue_after_document_analysis():
         ).send()
         return
 
-
     questions = cl.user_session.get("questions") or []
     if not questions:
         questions = await cl.make_async(load_questions_from_DB)(cl.user_session.get("system_type"))
         cl.user_session.set("questions", questions)
     await apply_document_answers()
-
 
 async def process_document_upload(file):
     """Read a document, infer setup context, then answer the active questionnaire."""
@@ -1169,7 +1397,6 @@ async def process_document_upload(file):
     await cl.Message(content=summary).send()
     await continue_after_document_analysis()
 
-
 async def apply_document_answers():
     questions = cl.user_session.get("questions") or []
     document_text = cl.user_session.get("document_text") or ""
@@ -1233,10 +1460,10 @@ async def apply_document_answers():
         await cl.Message(content="\n\n".join(f"**{q}**\n{a}" for q, a in imported.items())).send()
     await ask_next_question()
 
-
 # ==========================================
 # FUNCTION: Asks the next question dynamically
 # ==========================================
+
 async def ask_next_question(last_user_input: str = ""):
     step = cl.user_session.get("step")
     if step in ("finalizing", "completed"):
@@ -1261,7 +1488,7 @@ async def ask_next_question(last_user_input: str = ""):
 
         # Set state to finalizing BEFORE translation and save to prevent re-entry
         cl.user_session.set("step", "finalizing")
-        
+
         translated_answers = {}
 
         async with cl.Step(name=step_name("translate_save")):
@@ -1302,8 +1529,20 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                     collected_data_english=translated_answers #translated_answers_to_save
                 )
                 db.add(nuova_sessione)
+
+                # Il risultato applicativo e il checkpoint di completamento
+                # devono essere confermati nella stessa transazione.
+                completed_state = snapshot_state()
+                completed_state["current_asked_question"] = None
+                completed_state["current_question_text"] = None
+                completed_state["step"] = "completed"
+                completed_state["finalization_started"] = True
+
+                write_checkpoint(db, completed_state)
                 db.commit()
 
+                # Nessun await tra commit e aggiornamento dello stato in memoria.
+                restore_state(completed_state)
                 db_saved_successfully = True
                 print(f"✅ Dati salvati con successo per la company: {company_name}")
 
@@ -1381,6 +1620,8 @@ Reply ONLY and EXCLUSIVELY with valid JSON in this format:
             )
 
     cl.user_session.set("current_asked_question", target_question)
+    cl.user_session.set("current_question_text", conversational_question)
+
     await cl.Message(content=f"💬 {conversational_question}").send()
 
 def convert_answers(data):
@@ -1390,3 +1631,186 @@ def convert_answers(data):
         else {"answer": value}
         for question, value in data.items()
     }
+
+# ==========================================
+# SESSION RESUME, STOP AND DISCONNECTION
+# ==========================================
+
+async def show_resume_point():
+    step = cl.user_session.get("step") or "language"
+
+    if step == "language":
+        await cl.Message(
+            content="Seleziona la lingua / Select your language:",
+            actions=language_actions(),
+        ).send()
+
+    elif step == "company":
+        await cl.Message(content=t(
+            "Inserisci il **nome della company**.",
+            "Please enter the **Company Name**.",
+        )).send()
+
+    elif step == "system":
+        await cl.Message(content=t(
+            "Inserisci il **nome del Target System**.",
+            "Please enter the **Target System Name**.",
+        )).send()
+
+    elif step == "system_type":
+        await cl.Message(
+            content=t(
+                "Seleziona il **tipo di target system**.",
+                "Select the **target system type**.",
+            ),
+            actions=system_type_actions(),
+        ).send()
+
+    elif step == "choose_method":
+        await cl.Message(
+            content=t(
+                "Come preferisci fornire i requisiti tecnici?",
+                "How would you like to provide the technical requirements?",
+            ),
+            actions=[
+                cl.Action(
+                    name="choose_method",
+                    payload={"value": "chat"},
+                    label=t("💬 Continua in chat", "💬 Continue in Chat"),
+                ),
+                cl.Action(
+                    name="choose_method",
+                    payload={"value": "excel"},
+                    label=t(
+                        "📊 Scarica & Carica Excel",
+                        "📊 Download & Upload Excel",
+                    ),
+                ),
+            ],
+        ).send()
+
+    elif step == "upload_excel":
+        # Riutilizza il callback originale e le sue istruzioni,
+        # evitando di acquisire nuovamente il lock del checkpoint.
+        cl.user_session.set("step", "choose_method")
+
+        await on_choose_method.__wrapped__(
+            cl.Action(
+                name="choose_method",
+                payload={"value": "excel"},
+                label="Excel",
+            )
+        )
+
+    elif step == "other_identification":
+        conversation = cl.user_session.get("other_conversation") or []
+        last_question = next(
+            (
+                item[3:]
+                for item in reversed(conversation)
+                if item.startswith("Q: ")
+            ),
+            None,
+        )
+
+        if last_question:
+            await cl.Message(content=f"💬 {last_question}").send()
+        else:
+            question = await cl.make_async(call_azure_llm)(
+                user_message=(
+                    "PREVIOUS CONTEXT:\n"
+                    "No previous context yet.\n\nAsk the next question."
+                ),
+                system_prompt=other_system_prompt_ask(),
+            )
+            cl.user_session.set("other_conversation", [f"Q: {question}"])
+            await cl.Message(content=f"💬 {question}").send()
+
+    elif step == "conversational_chat":
+        question = cl.user_session.get("current_question_text")
+        target = cl.user_session.get("current_asked_question")
+        answers = cl.user_session.get("answers") or {}
+
+        if question and target and not answers.get(target):
+            await cl.Message(content=f"💬 {question}").send()
+        else:
+            await ask_next_question()
+
+    elif step == "completed":
+        await cl.Message(content=t(
+            "Questa intervista è già conclusa. "
+            "Puoi consultare la cronologia o avviare una nuova chat.",
+            "This interview is already completed. "
+            "You can review its history or start a new chat.",
+        )).send()
+
+    else:
+        raise RuntimeError(f"Unsupported checkpoint step: {step!r}")
+
+@cl.on_chat_resume
+@checkpointed
+async def resume_chat(thread):
+    state = load_checkpoint(thread["id"])
+
+    if state is None:
+        await cl.Message(content=(
+            "Questa conversazione non ha un checkpoint applicativo. "
+            "Avvia una nuova chat.\n\n"
+            "This conversation has no application checkpoint. "
+            "Please start a new chat."
+        )).send()
+        return
+
+    restore_state(state)
+
+    await cl.Message(content=t(
+        "✅ Sessione ripristinata.",
+        "✅ Session restored.",
+    )).send()
+
+    await show_resume_point()
+
+async def cancel_active_turn():
+    runtime = runtime_state()
+    task = runtime["task"]
+
+    if task is not None and task is not asyncio.current_task():
+        if not task.done():
+            task.cancel()
+
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+@cl.on_stop
+async def stop_chat():
+    await cancel_active_turn()
+
+    await cl.Message(
+        content=t(
+            "⏸️ Elaborazione interrotta. "
+            "Puoi riprendere dall'ultimo passaggio salvato.",
+            "⏸️ Processing stopped. "
+            "You can continue from the last saved step.",
+        ),
+        actions=[
+            cl.Action(
+                name="continue_interview",
+                payload={},
+                label=t("▶️ Riprendi", "▶️ Continue"),
+            )
+        ],
+    ).send()
+
+@cl.action_callback("continue_interview")
+@checkpointed
+async def continue_interview(action: cl.Action):
+    await show_resume_point()
+
+@cl.on_chat_end
+async def end_chat():
+    session_id = cl.user_session.get("id")
+
+    try:
+        await cancel_active_turn()
+    finally:
+        _session_runtime.pop(session_id, None)

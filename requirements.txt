@@ -10,3 +10,4 @@ flask_sqlalchemy
 python-docx
 bcrypt
 pypdf>=5,<7
+asyncpg
