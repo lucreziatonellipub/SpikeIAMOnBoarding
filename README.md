@@ -64,6 +64,7 @@ DB_PASSWORD=mypass
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=iam_onboarding_db
+CHAINLIT_DATABASE_URL=postgresql+asyncpg://postgres:mypass@localhost:5432/iam_onboarding_db
 ```
 
 ### 5. Installa e Avvia il DB
