@@ -23,12 +23,14 @@ from contextlib import suppress
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from sqlalchemy import (
     Column,
+    Integer,
     MetaData,
     String,
     Table,
     Text,
     insert,
     select,
+    text,
     update,
 )
 
@@ -134,6 +136,88 @@ def user_lang_instruction() -> str:
         "ISTRUZIONE VINCOLANTE: rispondi ESCLUSIVAMENTE in Italiano, indipendentemente dalla lingua digitata dall'utente.",
         "BINDING INSTRUCTION: respond EXCLUSIVELY in English, regardless of the language typed by the user."
     )
+
+def is_non_empty_answer(value) -> bool:
+    """Return True only for a questionnaire answer containing actual content."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict) and "answer" in value:
+        return is_non_empty_answer(value.get("answer"))
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def calculate_questionnaire_progress(questions, answers):
+    """Calculate clamped questionnaire completeness and its answered/total fraction."""
+    questionnaire_questions = list(questions or [])
+    answer_map = answers if isinstance(answers, dict) else {}
+    total_questions = len(questionnaire_questions)
+    valid_answers = sum(
+        1
+        for question in questionnaire_questions
+        if is_non_empty_answer(answer_map.get(question))
+    )
+
+    if total_questions == 0:
+        progress = 0
+    else:
+        progress = round(valid_answers * 100 / total_questions)
+
+    progress = max(0, min(100, int(progress)))
+    return progress, valid_answers, total_questions
+
+
+def synchronize_state_progress(state):
+    """Recalculate progress from a checkpoint state and keep the state coherent."""
+    progress, valid_answers, total_questions = calculate_questionnaire_progress(
+        state.get("questions"),
+        state.get("answers"),
+    )
+    if state.get("step") == "completed":
+        progress = 100
+    state["progress"] = progress
+    return progress, valid_answers, total_questions
+
+
+def refresh_session_progress():
+    """Recalculate questionnaire progress and persist it in the Chainlit session."""
+    progress, valid_answers, total_questions = calculate_questionnaire_progress(
+        cl.user_session.get("questions") or [],
+        cl.user_session.get("answers") or {},
+    )
+    if cl.user_session.get("step") == "completed":
+        progress = 100
+    cl.user_session.set("progress", progress)
+    return progress, valid_answers, total_questions
+
+
+def set_questions(questions):
+    """Store questionnaire questions and immediately refresh completeness."""
+    cl.user_session.set("questions", list(questions or []))
+    refresh_session_progress()
+
+
+def format_progress(progress=None, valid_answers=None, total_questions=None, *, lang=None) -> str:
+    """Format questionnaire completeness for the selected language."""
+    if progress is None or valid_answers is None or total_questions is None:
+        progress, valid_answers, total_questions = refresh_session_progress()
+    return t(
+        f"📊 Completezza: {progress}% ({valid_answers}/{total_questions} risposte)",
+        f"📊 Completeness: {progress}% ({valid_answers}/{total_questions} answers)",
+        lang=lang,
+    )
+
+
+async def show_progress():
+    """Recalculate and display the current questionnaire completeness once."""
+    progress, valid_answers, total_questions = refresh_session_progress()
+    await cl.Message(
+        content=format_progress(progress, valid_answers, total_questions)
+    ).send()
+
 
 def normalize_orchestrator_answers(extracted_data, question_catalog, questions, other_infos=None):
     """Accept the current ID schema and legacy response shapes without losing answers."""
@@ -368,6 +452,7 @@ CHECKPOINT_KEYS = (
     "document_partial",
     "document_evidence",
     "answers",
+    "progress",
     "other_infos",
     "step",
     "lang_code",
@@ -391,6 +476,7 @@ session_checkpoints = Table(
     Column("thread_id", String(255), primary_key=True),
     Column("owner", String(255), nullable=False),
     Column("state_json", Text, nullable=False),
+    Column("progress", Integer, nullable=False, default=0, server_default=text("0")),
 )
 
 # In produzione, creare questa tabella tramite la migrazione del progetto.
@@ -398,6 +484,14 @@ checkpoint_metadata.create_all(
     bind=engine,
     tables=[session_checkpoints],
 )
+
+# create_all non modifica le tabelle esistenti: applica una migrazione PostgreSQL
+# idempotente per i deployment già attivi.
+with engine.begin() as connection:
+    connection.execute(text(
+        "ALTER TABLE onboarding_chat_checkpoint "
+        "ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"
+    ))
 
 # Solo oggetti runtime: NON inserirli in cl.user_session.
 _session_runtime = {}
@@ -429,10 +523,13 @@ def snapshot_state():
 def restore_state(state):
     for key in CHECKPOINT_KEYS:
         cl.user_session.set(key, state.get(key))
+    refresh_session_progress()
 
 def write_checkpoint(db, state):
     """Scrive usando la transazione del chiamante."""
     thread_id, owner = session_identity()
+    progress, _, _ = synchronize_state_progress(state)
+    cl.user_session.set("progress", progress)
 
     existing_owner = db.execute(
         select(session_checkpoints.c.owner).where(
@@ -447,6 +544,7 @@ def write_checkpoint(db, state):
             thread_id=thread_id,
             owner=owner,
             state_json=payload,
+            progress=progress,
         ))
     else:
         if existing_owner != owner:
@@ -455,7 +553,7 @@ def write_checkpoint(db, state):
         db.execute(
             update(session_checkpoints)
             .where(session_checkpoints.c.thread_id == thread_id)
-            .values(state_json=payload)
+            .values(state_json=payload, progress=progress)
         )
 
 def save_checkpoint():
@@ -471,6 +569,7 @@ def load_checkpoint(thread_id):
             select(
                 session_checkpoints.c.owner,
                 session_checkpoints.c.state_json,
+                session_checkpoints.c.progress,
             ).where(
                 session_checkpoints.c.thread_id == str(thread_id)
             )
@@ -482,7 +581,15 @@ def load_checkpoint(thread_id):
     if row["owner"] != owner:
         raise PermissionError("Chat ownership mismatch.")
 
-    return json.loads(row["state_json"])
+    state = json.loads(row["state_json"])
+    stored_progress = row["progress"]
+    progress, _, _ = synchronize_state_progress(state)
+    if stored_progress != progress:
+        LOGGER.info(
+            "CHECKPOINT_PROGRESS_RECONCILED thread_id=%r stored=%r calculated=%r",
+            thread_id, stored_progress, progress,
+        )
+    return state
 
 def checkpointed(handler):
     """
@@ -623,6 +730,8 @@ async def start():
     cl.user_session.set("document_partial", {})
     cl.user_session.set("document_evidence", {})
     cl.user_session.set("answers", {})
+    set_questions([])
+    cl.user_session.set("progress", 0)
     cl.user_session.set("other_infos", [])
     cl.user_session.set("step", "language")
     cl.user_session.set("lang_code", None)
@@ -771,7 +880,7 @@ async def main(message: cl.Message):
 
             cl.user_session.set("system_type", system_type)
             questions = await cl.make_async(load_questions_from_DB)(system_type)
-            cl.user_session.set("questions", questions)
+            set_questions(questions)
             if cl.user_session.get("document_text"):
                 await apply_document_answers()
                 return
@@ -921,6 +1030,7 @@ Reply ONLY with valid JSON:
                     })
 
             cl.user_session.set("answers", answers)
+            refresh_session_progress()
 
             await cl.Message(
                 content=t(
@@ -943,6 +1053,7 @@ Reply ONLY with valid JSON:
                     )
                 await cl.Message(content="\n\n".join(warning_lines)).send()
 
+            await show_progress()
             cl.user_session.set("step", "conversational_chat")
             await ask_next_question(last_user_input=t(
                 "Ho caricato il file Excel. Per favore, revisiona le risposte.",
@@ -962,7 +1073,7 @@ Reply ONLY with valid JSON:
     if step == "conversational_chat":
         questions = cl.user_session.get("questions") or []
         current_question = cl.user_session.get("current_asked_question")
-        pending_questions = [q for q in questions if q not in answers or not answers[q]]
+        pending_questions = [q for q in questions if not is_non_empty_answer(answers.get(q))]
         pending_catalog = {f"P{index}": question for index, question in enumerate(pending_questions)}
         answered_catalog = {f"A{index}": question for index, question in enumerate(answers)}
         question_catalog = {**pending_catalog, **answered_catalog}
@@ -1105,6 +1216,7 @@ RULES:
                 stored_other_infos = cl.user_session.get("other_infos") or []
                 cl.user_session.set("other_infos", list(dict.fromkeys(stored_other_infos + other_infos)))
                 await cl.Message(content=response_message).send()
+                await show_progress()
                 await ask_next_question(last_user_input=message.content)
 
             else:
@@ -1172,7 +1284,7 @@ async def on_choose_type(action: cl.Action):
 
         cl.user_session.set("system_type", system_type)
         questions = await cl.make_async(load_questions_from_DB)(system_type)
-        cl.user_session.set("questions", questions)
+        set_questions(questions)
         if cl.user_session.get("document_text"):
             await apply_document_answers()
             return
@@ -1304,7 +1416,7 @@ async def continue_after_document_analysis():
     questions = cl.user_session.get("questions") or []
     if not questions:
         questions = await cl.make_async(load_questions_from_DB)(cl.user_session.get("system_type"))
-        cl.user_session.set("questions", questions)
+        set_questions(questions)
     await apply_document_answers()
 
 async def process_document_upload(file):
@@ -1427,11 +1539,16 @@ async def apply_document_answers():
     # Explicit conversational answers take precedence over imported facts.
     imported = {}
     for question, answer in complete.items():
-        if question not in answers:
+        if (
+            question in questions
+            and not is_non_empty_answer(answers.get(question))
+            and is_non_empty_answer(answer)
+        ):
             answers[question] = answer
             imported[question] = answer
     cl.user_session.set("answers", answers)
-    active_partial = {q: v for q, v in partial.items() if q not in answers}
+    refresh_session_progress()
+    active_partial = {q: v for q, v in partial.items() if q in questions and not is_non_empty_answer(answers.get(q))}
     cl.user_session.set("document_partial", active_partial)
     cl.user_session.set("document_evidence", evidence)
     cl.user_session.set("step", "conversational_chat")
@@ -1439,7 +1556,7 @@ async def apply_document_answers():
         "DOCUMENT_ANSWERS_RESULT extracted_complete=%d imported_new=%d partial=%d "
         "total_answers=%d still_missing=%d",
         len(complete), len(imported), len(active_partial), len(answers),
-        len([question for question in questions if not answers.get(question)]),
+        len([question for question in questions if not is_non_empty_answer(answers.get(question))]),
     )
     for question, value in active_partial.items():
         LOGGER.info(
@@ -1458,6 +1575,7 @@ async def apply_document_answers():
         )).send()
     if imported:
         await cl.Message(content="\n\n".join(f"**{q}**\n{a}" for q, a in imported.items())).send()
+    await show_progress()
     await ask_next_question()
 
 # ==========================================
@@ -1472,7 +1590,7 @@ async def ask_next_question(last_user_input: str = ""):
     questions = cl.user_session.get("questions") or []
     answers = cl.user_session.get("answers") or {}
 
-    pending_questions = [q for q in questions if q not in answers or not answers[q]]
+    pending_questions = [q for q in questions if not is_non_empty_answer(answers.get(q))]
     LOGGER.info(
         "QUESTION_PROGRESS total=%d answered=%d pending=%d current=%r",
         len(questions), len(questions) - len(pending_questions), len(pending_questions),
@@ -1537,6 +1655,7 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
                 completed_state["current_question_text"] = None
                 completed_state["step"] = "completed"
                 completed_state["finalization_started"] = True
+                completed_state["progress"] = 100
 
                 write_checkpoint(db, completed_state)
                 db.commit()
@@ -1552,6 +1671,7 @@ Respond ONLY and EXCLUSIVELY with the valid translated JSON object. No markdown,
         # Reset current question pointer and mark session completed
         cl.user_session.set("current_asked_question", None)
         cl.user_session.set("step", "completed")
+        cl.user_session.set("progress", 100)
 
         if db_saved_successfully:
             await cl.Message(content="**Interview completed.** We have successfully gathered all the necessary technical requirements. The data has been securely saved to our system. Thank you for your time.").send()
@@ -1731,7 +1851,7 @@ async def show_resume_point():
         target = cl.user_session.get("current_asked_question")
         answers = cl.user_session.get("answers") or {}
 
-        if question and target and not answers.get(target):
+        if question and target and not is_non_empty_answer(answers.get(target)):
             await cl.Message(content=f"💬 {question}").send()
         else:
             await ask_next_question()
@@ -1768,6 +1888,7 @@ async def resume_chat(thread):
         "✅ Session restored.",
     )).send()
 
+    await show_progress()
     await show_resume_point()
 
 async def cancel_active_turn():
