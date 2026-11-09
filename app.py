@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 from database import get_db
-from models import Question, OnboardingSession
+from models import Question, OnboardingSession, OnboardingChatCheckpoint
 from database import engine, SessionLocal
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -21,18 +21,7 @@ from functools import partial, wraps
 from contextlib import suppress
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
-from sqlalchemy import (
-    Column,
-    Integer,
-    MetaData,
-    String,
-    Table,
-    Text,
-    insert,
-    select,
-    text,
-    update,
-)
+from sqlalchemy import insert, select, text, update
 
 from auth import verify_password, load_users
 
@@ -468,31 +457,6 @@ CHECKPOINT_KEYS = (
     "finalization_started",
 )
 
-checkpoint_metadata = MetaData()
-
-session_checkpoints = Table(
-    "onboarding_chat_checkpoint",
-    checkpoint_metadata,
-    Column("thread_id", String(255), primary_key=True),
-    Column("owner", String(255), nullable=False),
-    Column("state_json", Text, nullable=False),
-    Column("progress", Integer, nullable=False, default=0, server_default=text("0")),
-)
-
-# In produzione, creare questa tabella tramite la migrazione del progetto.
-checkpoint_metadata.create_all(
-    bind=engine,
-    tables=[session_checkpoints],
-)
-
-# create_all non modifica le tabelle esistenti: applica una migrazione PostgreSQL
-# idempotente per i deployment già attivi.
-with engine.begin() as connection:
-    connection.execute(text(
-        "ALTER TABLE onboarding_chat_checkpoint "
-        "ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0"
-    ))
-
 # Solo oggetti runtime: NON inserirli in cl.user_session.
 _session_runtime = {}
 
@@ -532,15 +496,15 @@ def write_checkpoint(db, state):
     cl.user_session.set("progress", progress)
 
     existing_owner = db.execute(
-        select(session_checkpoints.c.owner).where(
-            session_checkpoints.c.thread_id == thread_id
+        select(OnboardingChatCheckpoint.owner).where(
+            OnboardingChatCheckpoint.thread_id == thread_id
         )
     ).scalar_one_or_none()
 
     payload = json.dumps(state, ensure_ascii=False)
 
     if existing_owner is None:
-        db.execute(insert(session_checkpoints).values(
+        db.execute(insert(OnboardingChatCheckpoint).values(
             thread_id=thread_id,
             owner=owner,
             state_json=payload,
@@ -551,8 +515,8 @@ def write_checkpoint(db, state):
             raise PermissionError("Chat ownership mismatch.")
 
         db.execute(
-            update(session_checkpoints)
-            .where(session_checkpoints.c.thread_id == thread_id)
+            update(OnboardingChatCheckpoint)
+            .where(OnboardingChatCheckpoint.thread_id == thread_id)
             .values(state_json=payload, progress=progress)
         )
 
@@ -567,11 +531,11 @@ def load_checkpoint(thread_id):
     with get_db() as db:
         row = db.execute(
             select(
-                session_checkpoints.c.owner,
-                session_checkpoints.c.state_json,
-                session_checkpoints.c.progress,
+                OnboardingChatCheckpoint.owner,
+                OnboardingChatCheckpoint.state_json,
+                OnboardingChatCheckpoint.progress,
             ).where(
-                session_checkpoints.c.thread_id == str(thread_id)
+                OnboardingChatCheckpoint.thread_id == str(thread_id)
             )
         ).mappings().first()
 

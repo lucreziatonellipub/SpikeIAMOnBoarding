@@ -33,6 +33,20 @@ class OnboardingSession(Base):
     collected_data_english = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class OnboardingChatCheckpoint(Base):
+    __tablename__ = "onboarding_chat_checkpoint"
+
+    thread_id = Column(String(255), primary_key=True)
+    owner = Column(String(255), nullable=False)
+    # Contiene il JSON serializzato con json.dumps (come prima: colonna TEXT)
+    state_json = Column(Text, nullable=False)
+    progress = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+
 
 class Question(Base):
     __tablename__ = "question"
