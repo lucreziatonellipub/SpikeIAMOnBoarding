@@ -21,11 +21,18 @@ from functools import partial, wraps
 from contextlib import suppress
 
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+from chainlit.data import get_data_layer
+from onboarding_data_layer import OnboardingDataLayer
+from interview_state import interview_started
 from sqlalchemy import insert, select, text, update
 
 from auth import verify_password, load_users
+from sidebar_progress import (
+    broadcast_sidebar_progress, build_chat_title, install_sidebar_progress, sidebar_details,
+)
 
 load_dotenv()
+install_sidebar_progress()
 
 @cl.data_layer
 def get_chainlit_data_layer():
@@ -45,7 +52,7 @@ def get_chainlit_data_layer():
             "Non modificare la connessione sincrona di database.py."
         )
 
-    return SQLAlchemyDataLayer(conninfo=conninfo)
+    return OnboardingDataLayer(conninfo=conninfo)
 
 LOG_LEVEL_NAME = os.getenv("ONBOARDING_LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
@@ -203,6 +210,8 @@ def format_progress(progress=None, valid_answers=None, total_questions=None, *, 
 async def show_progress():
     """Recalculate and display the current questionnaire completeness once."""
     progress, valid_answers, total_questions = refresh_session_progress()
+    # Do not wait for the following LLM question/translation to finish.
+    await publish_sidebar_progress()
     await cl.Message(
         content=format_progress(progress, valid_answers, total_questions)
     ).send()
@@ -491,6 +500,8 @@ def restore_state(state):
 
 def write_checkpoint(db, state):
     """Scrive usando la transazione del chiamante."""
+    if not interview_started(state):
+        return
     thread_id, owner = session_identity()
     progress, _, _ = synchronize_state_progress(state)
     cl.user_session.set("progress", progress)
@@ -524,6 +535,41 @@ def save_checkpoint():
     with get_db() as db:
         write_checkpoint(db, snapshot_state())
         db.commit()
+
+async def publish_sidebar_progress():
+    """Publish the current score immediately; checkpoint rollback publishes it again."""
+    thread_id, owner = session_identity()
+    state = snapshot_state()
+    broadcast_sidebar_progress(owner, {
+        "thread_id": thread_id,
+        **sidebar_details(state, state.get("progress") or 0),
+    })
+
+
+async def persist_chat_title():
+    """Never lock Chainlit's threads table with synchronous SQL on its event loop."""
+    title = build_chat_title(snapshot_state())
+    runtime = runtime_state()
+    if not title or runtime.get("persisted_title") == title:
+        return
+    try:
+        layer = get_data_layer()
+        if layer is not None:
+            thread_id, _ = session_identity()
+            # metadata={} preserves the thread creation date in Chainlit's layer.
+            if hasattr(layer, "activate_thread"):
+                user = cl.user_session.get("user")
+                activated = await layer.activate_thread(thread_id, title, getattr(user, "id", None))
+                if activated:
+                    await cl.context.emitter.emit("first_interaction", {
+                        "interaction": title, "thread_id": thread_id,
+                    })
+            else:
+                await layer.update_thread(thread_id=thread_id, name=title, metadata={})
+            runtime["persisted_title"] = title
+    except Exception:
+        LOGGER.warning("CHAT_TITLE_UPDATE_FAILED", exc_info=True)
+
 
 def load_checkpoint(thread_id):
     _, owner = session_identity()
@@ -573,6 +619,8 @@ def checkpointed(handler):
             try:
                 result = await handler(*args, **kwargs)
                 save_checkpoint()
+                await publish_sidebar_progress()
+                await persist_chat_title()
                 return result
 
             except asyncio.CancelledError:
@@ -580,6 +628,7 @@ def checkpointed(handler):
                     restore_state(before)
 
                 save_checkpoint()
+                await publish_sidebar_progress()
                 raise
 
             except Exception:
@@ -587,6 +636,7 @@ def checkpointed(handler):
                     restore_state(before)
 
                 save_checkpoint()
+                await publish_sidebar_progress()
                 raise
 
             finally:
@@ -1898,4 +1948,7 @@ async def end_chat():
     try:
         await cancel_active_turn()
     finally:
+        layer = get_data_layer()
+        if hasattr(layer, "discard_draft"):
+            layer.discard_draft(str(cl.context.session.thread_id))
         _session_runtime.pop(session_id, None)

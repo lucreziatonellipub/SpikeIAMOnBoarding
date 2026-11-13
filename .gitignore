@@ -5,6 +5,7 @@ env/
 
 # Variabili d'ambiente (MOLTO IMPORTANTE)
 .env
+backups/
 
 # Cache di Python
 __pycache__/

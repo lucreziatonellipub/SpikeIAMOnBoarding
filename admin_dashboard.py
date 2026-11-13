@@ -16,7 +16,8 @@ from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from dotenv import load_dotenv
 from database import get_db
-from models import OnboardingSession, Question, Base
+from models import OnboardingSession, OnboardingChatCheckpoint, Question, Base
+from interview_state import interview_started
 
 # Load environment variables
 load_dotenv()
@@ -926,9 +927,18 @@ async function deleteQuestion(id) {
 INTERVIEWS_TEMPLATE = '''
 {% extends base %}
 {% block content %}
+<link rel="stylesheet" href="{{ url_for('static', filename='interviews.css') }}">
 <div class="card">
     <div class="card-header">
-        <h2>Interview Sessions</h2>
+        <h2>In progress</h2>
+        <span style="font-size:0.85rem;color:var(--text-muted);" id="inProgressCount"></span>
+    </div>
+    <div class="table-container" id="inProgressTable"><div class="empty-state">Loading...</div></div>
+    <div id="activePager" style="padding:16px"></div>
+</div>
+<div class="card">
+    <div class="card-header">
+        <h2>Completed interviews</h2>
         <span style="font-size:0.85rem;color:var(--text-muted);" id="sessionCount"></span>
     </div>
     <div class="table-container" id="sessionsTable">
@@ -937,15 +947,16 @@ INTERVIEWS_TEMPLATE = '''
             <h3>Loading...</h3>
         </div>
     </div>
+    <div id="completedPager" style="padding:16px"></div>
 </div>
 
-<div class="modal-overlay" id="sessionModal">
-    <div class="modal" style="max-width:700px;">
-        <h2 id="sessionModalTitle">Interview Details</h2>
-        <div id="sessionModalContent"></div>
-        <div style="display:flex;justify-content:flex-end;margin-top:24px;">
-            <button class="btn" style="background:var(--bg-hover);color:var(--text-secondary);" onclick="closeSessionModal()">Close</button>
+<div class="modal-overlay" id="sessionModal" role="dialog" aria-modal="true" aria-labelledby="sessionModalTitle">
+    <div class="modal interview-dialog">
+        <div class="interview-dialog-header">
+            <div><div class="detail-eyebrow">INTERVIEW DETAILS</div><h2 id="sessionModalTitle">Interview Details</h2></div>
+            <button class="detail-close" aria-label="Close interview details" onclick="closeSessionModal()">&times;</button>
         </div>
+        <div id="sessionModalContent"></div>
     </div>
 </div>
 {% endblock %}
@@ -953,13 +964,78 @@ INTERVIEWS_TEMPLATE = '''
 {% block scripts %}
 <script>
 document.addEventListener('DOMContentLoaded', loadSessions);
+setInterval(() => { if (!document.hidden) loadSessions(); }, 5000);
+let loadingSessions = false;
+const interviewPages = {active: 1, completed: 1};
+const interviewPageSizes = {active: 10, completed: 10};
+
+function changeInterviewPage(group, delta) {
+    if (loadingSessions) return;
+    interviewPages[group] = Math.max(1, interviewPages[group] + delta);
+    loadSessions();
+}
+function changeInterviewPageSize(group, size) {
+    if (loadingSessions) return;
+    interviewPageSizes[group] = Number(size);
+    interviewPages[group] = 1;
+    loadSessions();
+}
+function goToInterviewPage(group, page) {
+    if (loadingSessions) return;
+    interviewPages[group] = page;
+    loadSessions();
+}
+function renderInterviewPager(group, data) {
+    interviewPages[group] = data.page;
+    const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+    const end = Math.min(data.page * data.page_size, data.total);
+    const visible = [...new Set([1, data.pages, data.page - 1, data.page, data.page + 1])].filter(p => p >= 1 && p <= data.pages).sort((a,b) => a-b);
+    let numbers = '';
+    visible.forEach((page, index) => {
+        if (index && page - visible[index-1] > 1) numbers += '<span class="pager-gap">…</span>';
+        numbers += '<button class="pager-button" ' + (page === data.page ? 'aria-current="page"' : '') + ' aria-label="Page ' + page + '" onclick="goToInterviewPage(&quot;' + group + '&quot;, ' + page + ')">' + page + '</button>';
+    });
+    const pager = document.getElementById(group + 'Pager');
+    pager.className = 'interview-pager';
+    pager.innerHTML = '<div class="pager-summary"><strong>' + start + '–' + end + '</strong> of ' + data.total + ' interviews</div>' +
+        '<div class="pager-controls"><label class="pager-size">Rows per page <select aria-label="' + group + ' rows per page" onchange="changeInterviewPageSize(&quot;' + group + '&quot;, this.value)">' +
+        [10, 25, 50, 100].map(size => '<option value="' + size + '" ' + (size === data.page_size ? 'selected' : '') + '>' + size + '</option>').join('') + '</select></label>' +
+        '<nav class="pager-pages" aria-label="' + group + ' interview pages"><button class="pager-button" aria-label="Previous page" ' + (data.page <= 1 ? 'disabled' : '') + ' onclick="changeInterviewPage(&quot;' + group + '&quot;, -1)">&#8249;</button>' + numbers +
+        '<button class="pager-button" aria-label="Next page" ' + (data.page >= data.pages ? 'disabled' : '') + ' onclick="changeInterviewPage(&quot;' + group + '&quot;, 1)">&#8250;</button></nav></div>';
+}
 
 async function loadSessions() {
+    if (loadingSessions) return;
+    loadingSessions = true;
     try {
-        const response = await fetch('/api/sessions');
-        const sessions = await response.json();
+        const [response, activeResponse] = await Promise.all([
+            fetch('/api/sessions?page=' + interviewPages.completed + '&page_size=' + interviewPageSizes.completed),
+            fetch('/api/interviews/in-progress?page=' + interviewPages.active + '&page_size=' + interviewPageSizes.active)
+        ]);
+        if (!response.ok || !activeResponse.ok || response.redirected || activeResponse.redirected) {
+            throw new Error('Unable to load interviews. Please check your login.');
+        }
+        const completedPage = await response.json();
+        const activePage = await activeResponse.json();
+        const sessions = completedPage.items;
+        const active = activePage.items;
+        renderInterviewPager('active', activePage);
+        renderInterviewPager('completed', completedPage);
+        document.getElementById('inProgressCount').textContent = activePage.total + ' in progress';
+        let activeHtml = '<table><thead><tr><th>Company</th><th>Target System</th><th>System Type</th><th>User</th><th>Status</th><th>Progress</th><th>Actions</th></tr></thead><tbody>';
+        active.forEach(s => {
+            activeHtml += '<tr><td>' + escapeHtml(s.company || 'Not entered yet') + '</td>';
+            activeHtml += '<td>' + escapeHtml(s.target_system || 'Not entered yet') + '</td>';
+            activeHtml += '<td>' + escapeHtml(s.system_type || 'Not selected yet') + '</td>';
+            activeHtml += '<td>' + escapeHtml(s.owner) + '</td>';
+            activeHtml += '<td>' + escapeHtml(s.status_label) + '</td>';
+            activeHtml += '<td style="min-width:130px"><div>' + s.progress + '%</div><progress aria-label="Questionnaire completion" max="100" value="' + s.progress + '" style="width:100%;accent-color:var(--accent-primary)"></progress></td>';
+            activeHtml += '<td><button class="btn btn-sm btn-primary" data-thread-id="' + escapeHtml(s.thread_id).replace(/"/g, '&quot;') + '" onclick="viewSession(this.dataset.threadId, true)">View</button></td></tr>';
+        });
+        activeHtml += '</tbody></table>';
+        document.getElementById('inProgressTable').innerHTML = active.length ? activeHtml : '<div class="empty-state">No interviews in progress</div>';
         const container = document.getElementById('sessionsTable');
-        document.getElementById('sessionCount').textContent = sessions.length + ' total';
+        document.getElementById('sessionCount').textContent = completedPage.total + ' completed';
 
         if (sessions.length === 0) {
             container.innerHTML = '<div class="empty-state"><div class="empty-icon">🎤</div><h3>No interviews yet</h3><p>Interviews will appear here once users start the onboarding process.</p></div>';
@@ -982,49 +1058,19 @@ async function loadSessions() {
         container.innerHTML = html;
     } catch (err) {
         showToast('Failed to load sessions: ' + err.message, 'error');
+    } finally {
+        loadingSessions = false;
     }
 }
 
-async function viewSession(id) {
-    try {
-        const response = await fetch('/api/sessions/' + id);
-        const s = await response.json();
-        document.getElementById('sessionModalTitle').textContent = (s.company || 'Unknown') + ' - ' + (s.target_system || 'N/A');
-
-        let html = '<div style="display:grid;gap:12px;">';
-        html += '<div><strong>System Type:</strong> ' + escapeHtml(s.system_type || 'N/A') + '</div>';
-        html += '<div><strong>Created:</strong> ' + (s.created_at ? new Date(s.created_at).toLocaleString() : 'N/A') + '</div>';
-
-        if (s.collected_data_english && Object.keys(s.collected_data_english).length > 0) {
-            html += '<div style="margin-top:16px;"><strong>Collected Data (English):</strong></div>';
-            html += '<div style="background:var(--bg-primary);border-radius:8px;padding:16px;margin-top:8px;max-height:300px;overflow-y:auto;">';
-            for (const [key, value] of Object.entries(s.collected_data_english)) {
-                html += '<div style="margin-bottom:12px;"><div style="color:var(--accent-primary);font-size:0.8rem;font-weight:600;">' + escapeHtml(key) + '</div>';
-                html += '<div style="color:var(--text-secondary);font-size:0.9rem;">' + escapeHtml(String(value)) + '</div></div>';
-            }
-            html += '</div>';
-        } else if (s.collected_data_original && Object.keys(s.collected_data_original).length > 0) {
-            html += '<div style="margin-top:16px;"><strong>Collected Data:</strong></div>';
-            html += '<div style="background:var(--bg-primary);border-radius:8px;padding:16px;margin-top:8px;max-height:300px;overflow-y:auto;">';
-            for (const [key, value] of Object.entries(s.collected_data_original)) {
-                html += '<div style="margin-bottom:12px;"><div style="color:var(--accent-primary);font-size:0.8rem;font-weight:600;">' + escapeHtml(key) + '</div>';
-                html += '<div style="color:var(--text-secondary);font-size:0.9rem;">' + escapeHtml(String(value)) + '</div></div>';
-            }
-            html += '</div>';
-        }
-
-        html += '</div>';
-        document.getElementById('sessionModalContent').innerHTML = html;
-        document.getElementById('sessionModal').classList.add('active');
-    } catch (err) {
-        showToast('Failed to load session: ' + err.message, 'error');
-    }
+async function viewSession(id, checkpoint = false) {
+    await openInterviewDetails(id, checkpoint);
 }
-
 function closeSessionModal() {
-    document.getElementById('sessionModal').classList.remove('active');
+    closeInterviewDetails();
 }
 </script>
+<script src="{{ url_for('static', filename='interview-details.js') }}"></script>
 {% endblock %}
 '''
 
@@ -1323,11 +1369,107 @@ def api_delete_question(question_id):
         db.commit()
         return jsonify({'message': 'Question deleted'})
 
+INTERVIEW_PHASES = {
+    'language': 'Language selection',
+    'company': 'Company input',
+    'system': 'Target system input',
+    'system_type': 'System type selection',
+    'other_identification': 'System identification',
+    'choose_method': 'Questionnaire method selection',
+    'upload_excel': 'Awaiting Excel upload',
+    'conversational_chat': 'Questionnaire in progress',
+    'finalizing': 'Saving final results',
+    'completed': 'Completed',
+}
+
+
+def checkpoint_interview(checkpoint, *, include_answers=False):
+    """The column is the source of progress; the saved step is the source of phase."""
+    try:
+        state = json.loads(checkpoint.state_json)
+        if not isinstance(state, dict):
+            state = {}
+    except (TypeError, ValueError):
+        state = {}
+    step = state.get('step') or 'unknown'
+    result = {
+        'started': interview_started(state),
+        'thread_id': checkpoint.thread_id,
+        'owner': checkpoint.owner,
+        'company': state.get('company'),
+        'target_system': state.get('system'),
+        'system_type': state.get('system_type'),
+        'step': step,
+        'status_label': INTERVIEW_PHASES.get(step, step.replace('_', ' ').capitalize()),
+        'progress': checkpoint.progress,
+    }
+    if include_answers:
+        result['collected_data_original'] = state.get('answers') or {}
+        result['questions'] = state.get('questions') or []
+        result['document_partial'] = state.get('document_partial') or {}
+        result['current_question'] = state.get('current_asked_question')
+        result['other_infos'] = state.get('other_infos') or []
+        result['document_names'] = state.get('document_names') or []
+    return result
+
+
+@app.route('/api/interviews/in-progress', methods=['GET'])
+@login_required
+def api_in_progress_interviews():
+    with get_db() as db:
+        checkpoints = db.query(OnboardingChatCheckpoint).order_by(
+            OnboardingChatCheckpoint.owner, OnboardingChatCheckpoint.thread_id
+        ).all()
+        interviews = [checkpoint_interview(checkpoint) for checkpoint in checkpoints]
+        # 100% answers can still be finalizing: completeness is not completion.
+        items = [interview for interview in interviews if interview['started'] and interview['step'] != 'completed']
+        if request.args.get('page') is not None:
+            page, size = interview_pagination()
+            page = min(page, max(1, (len(items) + size - 1) // size))
+            return jsonify(interview_page(items[(page-1)*size:page*size], len(items), page, size))
+        return jsonify(items)
+
+
+@app.route('/api/interviews/checkpoints/<thread_id>', methods=['GET'])
+@login_required
+def api_checkpoint_interview(thread_id):
+    with get_db() as db:
+        checkpoint = db.get(OnboardingChatCheckpoint, thread_id)
+        if checkpoint is None:
+            return jsonify({'error': 'Interview not found'}), 404
+        return jsonify(checkpoint_interview(checkpoint, include_answers=True))
+
+
+def interview_pagination():
+    try:
+        page = int(request.args.get('page', 1))
+        size = int(request.args.get('page_size', 10))
+    except ValueError:
+        from flask import abort
+        abort(400)
+    if page < 1 or size not in (10, 25, 50, 100):
+        from flask import abort
+        abort(400)
+    return page, size
+
+
+def interview_page(items, total, page, size):
+    return dict(items=items, total=total, page=page, page_size=size,
+                pages=max(1, (total + size - 1) // size))
+
+
 @app.route('/api/sessions', methods=['GET'])
 @login_required
 def api_get_sessions():
     with get_db() as db:
-        sessions = db.query(OnboardingSession).order_by(OnboardingSession.created_at.desc()).all()
+        query = db.query(OnboardingSession).order_by(OnboardingSession.created_at.desc(), OnboardingSession.id.desc())
+        paged = request.args.get('page') is not None
+        if paged:
+            page, size = interview_pagination()
+            total = query.count()
+            page = min(page, max(1, (total + size - 1) // size))
+            query = query.offset((page - 1) * size).limit(size)
+        sessions = query.all()
         result = []
         for s in sessions:
             collected_original = s.collected_data_original
@@ -1352,7 +1494,7 @@ def api_get_sessions():
                 'collected_data_original': collected_original or {},
                 'collected_data_english': collected_english or {}
             })
-        return jsonify(result)
+        return jsonify(interview_page(result, total, page, size) if paged else result)
 
 @app.route('/api/sessions/<int:session_id>', methods=['GET'])
 @login_required

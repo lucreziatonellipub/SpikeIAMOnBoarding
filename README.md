@@ -4,6 +4,62 @@ Un assistente conversazionale basato su **Chainlit** e potenziato da un LLM cust
 
 L'applicazione permette all'utente di fornire le informazioni tecniche tramite un'intervista guidata in chat (con validazione AI in tempo reale) oppure tramite il caricamento di un file Excel precompilato.
 
+### Interview nella dashboard admin
+
+La pagina **Interviews** separa le interview concluse, salvate in
+`onboarding_sessions`, da quelle in corso, lette da `onboarding_chat_checkpoint`.
+Per queste ultime mostra utente, fase (`state_json.step`) e percentuale dalla
+colonna `progress`, con aggiornamento ogni 5 secondi e dettaglio delle risposte
+salvate. Una fase `finalizing` resta in corso anche al 100%; i checkpoint
+`completed` sono esclusi dall'elenco in corso per non duplicare i risultati finali.
+Entrambe le sezioni hanno paginazione indipendente, totale record e selezione di
+10, 25, 50 o 100 righe per pagina; l'aggiornamento periodico conserva la pagina.
+Il dettaglio usa una finestra ampia con riepilogo e progresso a sinistra e
+questionario consultabile a destra: ricerca, filtri per risposte e domande da
+completare, contesto delle risposte parziali e traduzione inglese quando salvata.
+Il pulsante Refresh rilegge i dati mantenendo ricerca e filtri; Escape chiude la vista.
+Il dettaglio include un **Conversation summary** con cliente, applicativo, tipo,
+risposte sul totale, progresso e fase. Il testo è deterministico e non richiede
+chiamate AI: viene riutilizzato nella sessione del browser finché questi valori
+non cambiano. Apertura e Refresh controllano i dati; polling, ricerca e filtri non
+rigenerano il summary. Per i risultati storici privi del catalogo domande viene
+mostrato il numero di risposte salvate, segnalando il totale non disponibile.
+
+Le nuove chat restano temporanee finché company, target system e tipo non sono
+compilati. Solo allora vengono salvati il checkpoint e la cronologia Chainlit,
+con titolo `Company · Target System · System Type`. Le configurazioni abbandonate
+non creano interview nel database. Il buffer della configurazione è solo in memoria.
+
+Per verificare vecchi record vuoti: `python cleanup_unstarted_interviews.py`.
+Con `--apply` il comando salva prima i record coinvolti in `backups/` (esclusa da
+Git), elimina i checkpoint vuoti e le relative chat, e aggiorna i titoli avviati.
+I record con risposte, documenti o una configurazione completa sono preservati.
+
+### Completamento questionari nella cronologia chat
+
+Ogni chat nella barra laterale mostra la percentuale e una barra di completamento.
+I valori iniziali sono letti da `onboarding_chat_checkpoint.progress`, limitatamente
+alle chat dell'utente autenticato. Il browser riceve gli aggiornamenti tramite una
+connessione SSE autenticata, anche quando Chainlit è aperto in un iframe. La barra
+si aggiorna appena viene mostrato il punteggio della risposta, senza attendere la
+generazione della domanda successiva. Il salvataggio finale e le interruzioni
+riallineano l'indicatore al checkpoint; la riconnessione rilegge i valori salvati.
+La barra rimane sotto il titolo e viene evidenziata con hover o focus sulla chat.
+
+Il titolo diventa `Company · Target System · System Type` quando sono disponibili
+tutti e tre i campi. Viene salvato nella
+tabella `threads` tramite il data layer asincrono di Chainlit e aggiornato nella
+lista senza refresh. Il salvataggio del titolo non blocca quello delle risposte.
+
+Gli asset `public/sidebar-progress.js` e `public/sidebar-progress.css` sono configurati
+da `sidebar_progress.py`, senza modificare l'installazione di Chainlit o richiedere
+modifiche al database. Dopo l'aggiornamento, riavviare Chainlit e ricaricare la pagina.
+
+Verifica automatica: `python -m unittest discover -s tests -p test_sidebar_progress.py -v`.
+Per la verifica frontend, eseguire `python -m http.server 8765 --bind 127.0.0.1`
+dalla radice del progetto e aprire `http://127.0.0.1:8765/tests/sidebar_progress.html`:
+il risultato atteso è `PASS` (i dati e gli eventi di questa pagina di test sono simulati).
+
 ---
 
 ## 🛠️ Setup e Installazione Locale

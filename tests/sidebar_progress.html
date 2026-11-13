@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="it">
+<meta charset="utf-8">
+<title>Sidebar progress browser checks</title>
+<link rel="stylesheet" href="../public/sidebar-progress.css">
+<style>
+  :root { --muted-foreground: 0 0% 60%; --sidebar-accent: 0 0% 25%; --sidebar-accent-foreground: 0 0% 100%; --primary: 340 90% 50%; }
+  #thread-history li, .onboarding-progress { transition: none !important; }
+</style>
+<ul id="thread-history">
+  <li id="thread-old"><a><button data-sidebar="menu-button"><span><span class="truncate">Questionario esistente</span></span><div id="thread-options">...</div></button></a></li>
+</ul>
+<pre id="result">RUNNING</pre>
+<script>
+  // Make frame scheduling deterministic, including in a background/headless tab.
+  window.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+  window.requests = [];
+  window.snapshotValue = 42;
+  window.EventSource = class {
+    constructor() {
+      window.progressStream = this;
+      setTimeout(() => this.onopen?.(), 0);
+    }
+    close() {}
+  };
+  window.fetch = async (_url, options) => {
+    const ids = JSON.parse(options.body).thread_ids;
+    requests.push(ids);
+    if (ids.includes("race")) await new Promise(resolve => setTimeout(resolve, 100));
+    return {
+      ok: true,
+      json: async () => Object.fromEntries(
+        ids.filter(id => id !== "new").map(id => [id, {progress: id === "old" ? snapshotValue : 25}])
+      ),
+    };
+  };
+  window.addEventListener("error", event => {
+    document.getElementById("result").textContent = "FAIL: " + event.message;
+  });
+</script>
+<script src="../public/sidebar-progress.js"></script>
+<script>
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const value = id => document.querySelector("#thread-" + id + " [role=progressbar]")?.getAttribute("aria-valuenow");
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const row = id => {
+    const li = document.createElement("li");
+    li.id = "thread-" + id;
+    const button = document.createElement("button");
+    button.dataset.sidebar = "menu-button";
+    const title = document.createElement("span");
+    title.className = "truncate";
+    title.textContent = id;
+    button.append(title);
+    li.append(button);
+    document.getElementById("thread-history").append(li);
+  };
+  const update = (id, progress, name = null) => progressStream.onmessage({data: JSON.stringify({thread_id: id, progress, name})});
+  (async () => {
+    await sleep(100);
+    assert(value("old") === "42", "stored progress");
+    assert(document.querySelector("#thread-old .truncate").textContent === "Questionario esistente", "title preserved");
+    assert(!document.querySelector("#thread-options .onboarding-progress"), "no progress inside options button");
+    assert(!requests.flat().includes("options"), "only request actual chat IDs");
+    const initialRequests = requests.length;
+    update("old", 67, "ACME · HR"); await sleep(80);
+    assert(value("old") === "67", "live answer update");
+    assert(document.querySelector("#thread-old .truncate").dataset.onboardingTitle === "ACME · HR", "dynamic title");
+    assert(document.querySelector("#thread-old .truncate").textContent === "Questionario esistente", "preserve React text nodes");
+    update("old", 100, "ACME · HR"); await sleep(80);
+    assert(value("old") === "100", "completed answer");
+    row("new"); await sleep(80);
+    assert(value("new") === "0", "new chat");
+    row("race"); await sleep(20); update("race", 75); await sleep(180);
+    assert(value("race") === "75", "stale fetch must not overwrite live events");
+    document.getElementById("thread-old").remove(); row("old"); await sleep(80);
+    assert(value("old") === "100", "sidebar remount");
+    assert(document.querySelector("#thread-old .truncate").dataset.onboardingTitle === "ACME · HR", "title survives remount");
+    update("new", -10); await sleep(80);
+    assert(value("new") === "0", "clamp minimum");
+    update("new", 120); await sleep(80);
+    assert(value("new") === "100", "clamp maximum");
+    update("new", "bad"); await sleep(80);
+    assert(value("new") === "100", "reject invalid event");
+    assert(document.querySelectorAll("#thread-old .onboarding-progress").length === 1, "no duplicate indicators");
+    assert(requests.length === initialRequests + 2, "no repeated fetches on messages");
+    const indicator = document.querySelector("#thread-old");
+    const beforeFocus = getComputedStyle(indicator).backgroundColor;
+    document.querySelector("#thread-old button").focus(); await sleep(220);
+    assert(getComputedStyle(indicator).backgroundColor !== beforeFocus, "highlight entire lower indicator on focus");
+    snapshotValue = 95; progressStream.onopen(); await sleep(180);
+    assert(value("old") === "95", "reload saved progress after stream reconnects");
+    document.getElementById("result").textContent = "PASS: one lower bar, dynamic titles, live updates, completion, new chats, stale requests, remount, bounds, focus highlight, reconnect";
+  })().catch(error => document.getElementById("result").textContent = "FAIL: " + error.message);
+</script>
+</html>
